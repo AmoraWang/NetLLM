@@ -193,7 +193,12 @@ class OfflineRLPolicy(nn.Module):
             output_hidden_states=True,
             stop_layer_idx=self.which_layer,
         )
-        logits = transformer_outputs['last_hidden_state']
+        #logits = transformer_outputs['last_hidden_state']
+        if isinstance(transformer_outputs, dict):
+            logits = transformer_outputs['hidden_states'][-1]
+        else:
+            logits = transformer_outputs.hidden_states[-1] if hasattr(transformer_outputs, 'hidden_states') else transformer_outputs.last_hidden_state
+        
         if self.residual:
             logits = logits + stacked_inputs_ln  # residual add
 

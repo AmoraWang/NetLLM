@@ -196,15 +196,18 @@ def load_plm_llama(model_path):
     pad_token = '[PAD]'
 
     model_config = AutoConfig.from_pretrained(model_path)
+    #model_config = LlamaConfig.from_pretrained(model_path)
     #model_config.num_hidden_layers = 32
     model_config.output_hidden_states = True
     model_config.output_attentions = True
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    #tokenizer = LlamaTokenizer.from_pretrained(model_path)
     tokenizer.add_special_tokens({'pad_token': pad_token})
     tokenizer.pad_token = pad_token
 
     model = AutoModelForCausalLM.from_pretrained(model_path, config=model_config)
+    #model = LlamaModel.from_pretrained(model_path, config=model_config)
     model.resize_token_embeddings(len(tokenizer))
 
     return model, tokenizer, model_config

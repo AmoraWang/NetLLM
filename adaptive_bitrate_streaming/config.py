@@ -15,11 +15,13 @@ class Config:
         'fcc-train': _base_dir + 'data/traces/train/fcc-train/',
         'fcc-valid': _base_dir + 'data/traces/valid/fcc-valid/',
         'fcc-test': _base_dir + 'data/traces/test/fcc-test/',
+        'hsr-test': _base_dir + 'data/traces/test/hsr-test/',
     }
 
     video_size_dirs = {
         'video1': _base_dir + 'data/videos/video1_sizes/',
         'video2': _base_dir + 'data/videos/video2_sizes/',
+        'video3': _base_dir + 'data/videos/video3_sizes/',
     }
 
     artifacts_dir = _base_dir + 'artifacts/'

@@ -1,4 +1,4 @@
-python run_plm.py --adapt \
+python run_plm.py  \
                   --test \
                   --grad-accum-steps 32 \
                   --seed 666 \

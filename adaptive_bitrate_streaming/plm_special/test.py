@@ -30,6 +30,9 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
         target_return_clone = copy.deepcopy(target_return)
         ep_count = 0
         episodes_return, episodes_len = 0, 0
+        
+        # 用于统计模型决策时间
+        decision_times = []  # 存储每次决策的时间（秒）
     
         trace_idx = env.trace_idx
         results_log[trace_idx] = []
@@ -73,7 +76,13 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
                 episodes_return += reward
                 episodes_len += 1
 
+            # 统计模型决策时间
+            decision_start = time.time()
             bit_rate = model.sample(state, target_return, timestep)
+            decision_end = time.time()
+            decision_time = decision_end - decision_start
+            decision_times.append(decision_time)
+            
             timestep += 1
 
             if end_of_video:
@@ -118,6 +127,10 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
     # Average QoE per chunk
     mean_qoe_per_chunk = episodes_return / episodes_len if episodes_len > 0 else 0.0
     
+    # 计算平均决策时间
+    avg_decision_time = sum(decision_times) / len(decision_times) if len(decision_times) > 0 else 0.0
+    total_decision_time = sum(decision_times)
+    
     test_log.update({
         'mean_reward': mean_qoe,  # For backward compatibility
         'mean_qoe': mean_qoe,  # Average QoE per chunk (from result files)
@@ -125,5 +138,18 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
         'mean_qoe_per_chunk': mean_qoe_per_chunk,  # Average QoE per chunk (calculated directly)
         'episodes_count': ep_count,  # Number of episodes
         'total_chunks': episodes_len,  # Total number of chunks
+        'avg_decision_time': avg_decision_time,  # Average time per decision (seconds)
+        'total_decision_time': total_decision_time,  # Total time spent on decisions (seconds)
+        'decision_count': len(decision_times),  # Number of decisions made
     })
+    
+    # 打印决策时间统计信息
+    print(f'\nDecision Time Statistics:')
+    print(f'  Total decisions: {len(decision_times)}')
+    print(f'  Total decision time: {total_decision_time:.4f} seconds')
+    print(f'  Average decision time: {avg_decision_time:.6f} seconds ({avg_decision_time * 1000:.3f} ms)')
+    if len(decision_times) > 0:
+        print(f'  Min decision time: {min(decision_times) * 1000:.3f} ms')
+        print(f'  Max decision time: {max(decision_times) * 1000:.3f} ms')
+    
     return test_log

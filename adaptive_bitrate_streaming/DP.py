@@ -73,7 +73,10 @@ def solve_optimal_abr(times, bws, video_size, buffer_quantization_ms=100.0):
     """
     使用动态规划计算最优 ABR 路径
     """
-    total_chunks = len(video_size[0])
+    # 使用 TOTAL_VIDEO_CHUNK 而不是 len(video_size[0])，因为 env.py 中只处理 TOTAL_VIDEO_CHUNK 个 chunk
+    # 即使视频文件可能有更多行，env.py 会在 video_chunk_counter >= TOTAL_VIDEO_CHUNK 时停止
+    from baseline_special.utils.constants import TOTAL_VIDEO_CHUNK
+    total_chunks = int(TOTAL_VIDEO_CHUNK)
 
     # --- 1. 初始化 ---
     # current_states key: (last_bitrate, buffer_bin_index)
@@ -275,7 +278,22 @@ def generate_oracle_exp_pool(
             continue
 
         actions = best_state.history  # list[int], 每个元素为码率等级索引
-        total_chunks = len(actions)
+        # 使用 TOTAL_VIDEO_CHUNK 来确定 total_chunks，与 env.py 保持一致
+        # env.py 中会在 video_chunk_counter >= TOTAL_VIDEO_CHUNK 时停止，所以只处理 TOTAL_VIDEO_CHUNK 个 chunk
+        from baseline_special.utils.constants import TOTAL_VIDEO_CHUNK
+        total_chunks = int(TOTAL_VIDEO_CHUNK)
+        
+        # 确保 actions 长度与 total_chunks 一致（DP 应该返回 TOTAL_VIDEO_CHUNK 个 action）
+        if len(actions) != total_chunks:
+            print(f'  Warning: DP history length ({len(actions)}) != TOTAL_VIDEO_CHUNK ({total_chunks})')
+            # 如果 DP 返回了更多 action（因为视频文件有更多 chunk），截断到 TOTAL_VIDEO_CHUNK
+            if len(actions) > total_chunks:
+                actions = actions[:total_chunks]
+                print(f'  Truncated actions to {len(actions)} to match env.py behavior')
+            else:
+                # 如果 DP 返回了更少的 action，这不应该发生，但为了安全起见
+                print(f'  Error: DP returned fewer actions than expected. Using {len(actions)} actions.')
+                total_chunks = len(actions)
 
         # 初始化“物理环境”状态，与 solve_optimal_abr 中保持一致
         ptr = 1
@@ -287,6 +305,9 @@ def generate_oracle_exp_pool(
         last_bit_rate_idx = 0  # 对应 VIDEO_BIT_RATE[0]
 
         step_rewards = []
+        
+        # 记录处理前经验池的长度，用于调试
+        transitions_before = len(exp_pool)
 
         for chunk_idx, action_idx in enumerate(actions):
             curr_bitrate_kbps = VIDEO_BIT_RATE[action_idx]
@@ -338,6 +359,9 @@ def generate_oracle_exp_pool(
             rebuf_sec = rebuf_ms / MILLISECONDS_IN_SECOND
 
             buffer_size_ms = max(buffer_size_ms - delay_ms, 0.0) + VIDEO_CHUNK_LEN
+            # 限制 buffer 上限为 60 秒，与 solve_optimal_abr 保持一致
+            # 这确保生成的经验池与 DP 求解时的状态空间一致
+            buffer_size_ms = min(buffer_size_ms, 60000.0)
             buffer_size_sec = buffer_size_ms / MILLISECONDS_IN_SECOND
 
             # ========== 计算 QoE Reward ==========
@@ -356,7 +380,17 @@ def generate_oracle_exp_pool(
             step_rewards.append(reward)
 
             # ========== 更新状态表示 (S_INFO, S_LEN) ==========
-            # 滚动历史
+            # 注意：为了与 generate_exp_pool.py 完全对齐，
+            # 经验池中存储的 state 应该对应“做出当前动作之前”的观测，
+            # 即上一轮更新后的 state。
+            # 在 generate_exp_pool.py 中，顺序是：
+            #   1) env.get_video_chunk(...)  -> 得到 reward / delay 等
+            #   2) 先把当前 state append 到列表
+            #   3) 再 roll 并写入这次 chunk 的信息
+            # 因此这里需要在 roll 之前先备份一份 state，并在写入经验池时使用备份。
+            state_before_update = state.copy()
+
+            # 然后再更新当前 chunk 的信息到 state 中，用于下一步决策
             state = np.roll(state, -1, axis=1)
 
             # 1) 上一段码率（归一化到 [0,1]）
@@ -366,9 +400,8 @@ def generate_oracle_exp_pool(
             state[1, -1] = buffer_size_sec / BUFFER_NORM_FACTOR
 
             # 3) 过去带宽测量：chunk_size / 下载时间（kilo byte / ms）
-            #    这里使用除去 RTT 的“纯下载时间”近似（与 generate_exp_pool 的实现保持一致思路）
-            download_ms = max(delay_ms - LINK_RTT, 1e-6)
-            state[2, -1] = float(video_chunk_size) / download_ms / M_IN_K
+            #    与 generate_exp_pool.py 保持一致：使用包含 RTT 的 delay（env.py 返回的 delay 包含 RTT）
+            state[2, -1] = float(video_chunk_size) / float(delay_ms) / M_IN_K
 
             # 4) 过去下载时延（ms -> 归一化）
             state[3, -1] = float(delay_ms) / M_IN_K / BUFFER_NORM_FACTOR
@@ -386,12 +419,21 @@ def generate_oracle_exp_pool(
                 CHUNK_TIL_VIDEO_END_CAP
             )
 
+            # 与 env.py 保持一致：end_of_video 应该在下载完成后判断
+            # 在 env.py 中，video_chunk_counter 在下载完成后递增，然后检查是否 >= TOTAL_VIDEO_CHUNK
+            # 所以 chunk_idx == total_chunks - 1 时，下载完成后 video_chunk_counter 会变成 total_chunks，此时 end_of_video = True
+            # 但这里我们是在下载之前判断的，所以应该检查 chunk_idx + 1 >= total_chunks
+            # 实际上，由于我们跳过了第一个 chunk（chunk_idx > 0），最后一个有效的 chunk_idx 是 total_chunks - 1
+            # 所以 end_of_video 应该在这个 chunk 下载完成后为 True
+            # 为了与 env.py 完全一致，我们检查：如果这是最后一个 chunk（chunk_idx == total_chunks - 1），则 end_of_video = True
             end_of_video = (chunk_idx == total_chunks - 1)
 
             # 与 generate_exp_pool.py 保持一致：跳过第一个 step（类似 Pensieve 的做法）
+            # 此时 state_before_update 对应的是“在做出 action_idx 之前”的观测，
+            # 即与 generate_exp_pool.py 中 states[chunk_idx] 的语义一致。
             if chunk_idx > 0:
                 exp_pool.add(
-                    state=state.copy(),
+                    state=state_before_update,
                     action=action_idx,
                     reward=reward,
                     done=end_of_video,
@@ -399,6 +441,12 @@ def generate_oracle_exp_pool(
 
             last_bit_rate_idx = action_idx
 
+        # 调试信息：检查实际添加的 transition 数量
+        transitions_added = len(exp_pool) - transitions_before
+        expected_transitions = total_chunks - 1  # 减去跳过的第一个 chunk
+        if transitions_added != expected_transitions:
+            print(f'  Warning: Added {transitions_added} transitions, expected {expected_transitions} (total_chunks={total_chunks}, actions_len={len(actions)})')
+        
         if len(step_rewards) > 1:
             mean_qoe_excl_first = float(np.mean(step_rewards[1:]))
         else:
@@ -464,6 +512,7 @@ def compute_exp_pool_avg_qoe(exp_pool_path: str) -> float:
 
     return mean_qoe
 
+# ================= 合并经验池 =================
 
 def merge_exp_pools(input_paths, output_path):
     """
@@ -519,6 +568,24 @@ def merge_exp_pools(input_paths, output_path):
 
     return merged_pool
 
+def make_pkl_files(numbers, operation):
+    merge_queue = []
+    for number in numbers:
+        exp_pool = generate_oracle_exp_pool(
+            trace_folder=f'data/traces/{operation}/fcc-{operation}',
+            video_size_dir=f'data/videos/video{number}_sizes',
+            output_path=f'artifacts/exp_pools/{operation}v{number}_exp_pool.pkl',
+            trace_limit=-1,     
+            seed=100003,
+        )
+        merge_queue.append(f'artifacts/exp_pools/{operation}v{number}_exp_pool.pkl')
+    merged_exp_pool = merge_exp_pools(
+        merge_queue,
+        f'artifacts/exp_pools/{operation}_merge_exp_pool.pkl',
+    )
+    mean_qoe = compute_exp_pool_avg_qoe(f'artifacts/exp_pools/{operation}_merge_exp_pool.pkl')
+    print(f'{operation} Mean QoE:', mean_qoe)
+
 
 # ================= 运行入口 =================
 
@@ -564,8 +631,9 @@ if __name__ == '__main__':
     # exp_pool = generate_oracle_exp_pool(
     #     trace_folder='data/traces/test/fcc-test',
     #     #trace_folder='data/traces/train/fcc-train',
-    #     video_size_dir='data/videos/video2_sizes',
-    #     output_path='artifacts/exp_pools/testv2_exp_pool.pkl',
+    #     #trace_folder='data/traces/valid/fcc-valid',
+    #     video_size_dir='data/videos/video1_sizes',
+    #     output_path='artifacts/exp_pools/testv1_exp_pool.pkl',
     #     trace_limit=-1,     
     #     seed=100003,
     # )
@@ -573,12 +641,35 @@ if __name__ == '__main__':
     # ================= 合并经验池 =================    
     # merged_exp_pool = merge_exp_pools(
     #     [
-    #         'artifacts/exp_pools/oraclev1_exp_pool.pkl',
-    #         'artifacts/exp_pools/oraclev2_exp_pool.pkl',
+    #         'artifacts/exp_pools/trainv2_exp_pool.pkl',
+    #         'artifacts/exp_pools/validv2_exp_pool.pkl',
+    #         'artifacts/exp_pools/testv2_exp_pool.pkl',
     #     ],
-    #     'artifacts/exp_pools/exp_pool.pkl',
+    #     'artifacts/exp_pools/v2_merge_exp_pool.pkl',
     # )
 
     # ================= 计算 Oracle 经验池的平均 QoE =================
-    mean_qoe = compute_exp_pool_avg_qoe('artifacts/exp_pools/testv1_exp_pool.pkl')
+    mean_qoe = compute_exp_pool_avg_qoe('artifacts/exp_pools/exp_pool.pkl')
     print('Mean QoE:', mean_qoe)
+
+    # ================= 生成多个经验池并合并 =================
+    # make_pkl_files(numbers=[1,2], operation='train')
+    # make_pkl_files(numbers=[1,2], operation='valid')
+    # make_pkl_files(numbers=[1,2], operation='test')
+    # merged_exp_pool1 = merge_exp_pools(
+    #     [
+    #         'artifacts/exp_pools/trainv1_exp_pool.pkl',
+    #         'artifacts/exp_pools/validv1_exp_pool.pkl',
+    #         'artifacts/exp_pools/testv1_exp_pool.pkl',
+    #     ],
+    #     'artifacts/exp_pools/v1_merge_exp_pool.pkl',
+    # )
+    # merged_exp_pool2 = merge_exp_pools(
+    #     [
+    #         'artifacts/exp_pools/trainv2_exp_pool.pkl',
+    #         'artifacts/exp_pools/validv2_exp_pool.pkl',
+    #         'artifacts/exp_pools/testv2_exp_pool.pkl',
+    #     ],
+    #     'artifacts/exp_pools/v2_merge_exp_pool.pkl',
+    # )
+    pass

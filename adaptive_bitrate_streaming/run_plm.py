@@ -61,7 +61,7 @@ def load_model(args, model, model_dir):
         # load lora weights
         model.plm.load_adapter(model_dir, adapter_name='default')
         # load other modules except plm
-        model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin')))
+        model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin'), map_location={'cuda:1': 'cuda:0', 'cuda:2': 'cuda:0'}))
     else:
         # lora is disabled, load whole model
         model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin')))
