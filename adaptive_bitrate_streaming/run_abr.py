@@ -256,6 +256,7 @@ def run(args):
         model_dir = args.model_dir if args.model_dir is not None else best_model_dir
         assert os.path.exists(model_dir), f'Model weight dir {model_dir} does not exist.'
         test(args, abrllm_model, exp_dataset_info, env_settings, model_dir, results_dir, process_reward)
+        #test(args, abrllm_model, exp_dataset_info, env_settings, model_dir, results_dir, None)
 
 
 if __name__ == '__main__':

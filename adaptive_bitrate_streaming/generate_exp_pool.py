@@ -4,8 +4,6 @@ import pickle
 import itertools
 import random
 import numpy as np
-import tensorflow as tf
-import baseline_special.a3c as a3c
 import baseline_special.env as env
 from numba import jit
 from config import cfg
@@ -206,8 +204,12 @@ def collect_experience(args, model, model_name, env_settings, trace_num, sess, a
     total_dones = []
 
     print('Collect experience with model', model_name)
-    # with tf.Session() as sess:
     if model == PENSIEVE:
+        import tensorflow as tf
+        import baseline_special.a3c as a3c
+
+        if sess is None:
+            raise ValueError("Pensieve 基线需要 TensorFlow Session；请安装 tensorflow 并传入有效 sess。")
         if actor is None:
             model_path = cfg.baseline_model_paths[model_name]
             actor = a3c.ActorNetwork(sess, state_dim=[S_INFO ,S_LEN] ,action_dim=A_DIM , bitrate_dim=BITRATE_LEVELS)
@@ -313,6 +315,8 @@ def collect_experience(args, model, model_name, env_settings, trace_num, sess, a
 
 
 def run(args):
+    import tensorflow as tf
+
     assert args.trace in cfg.trace_dirs.keys()
     assert args.video in cfg.video_size_dirs.keys()
 

@@ -21,7 +21,7 @@ class ABRLLM(nn.Module):
         #Arguments prepare
         self.args = args
         self.llm_dim = args.llm_dim
-        self.tiny_vocab_size = 2048
+        self.tiny_vocab_size = 1000
         self.state_embedding_dim = args.state_embedding_dim
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.state_use_self_attention = args.state_use_self_attention

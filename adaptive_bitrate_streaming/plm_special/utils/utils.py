@@ -74,7 +74,27 @@ def calc_mean_reward(result_files, test_dir, str, skip_first_reward=True):
     return np.mean(reward)
 
 
+def mean_reward_from_results_log(results_log, skip_first_reward=True):
+    """
+    与 calc_mean_reward(..., skip_first_reward) 一致，但从内存中的 results_log 聚合。
+    results_log: trace_idx -> list of rows，每行至少 8 列，第 8 列为 reward（与 test 中 append 一致）。
+    """
+    reward = []
+    for values in results_log.values():
+        first_line = True
+        for items in values:
+            if first_line:
+                first_line = False
+                if skip_first_reward:
+                    continue
+            reward.append(float(items[7]))
+    return float(np.mean(reward)) if reward else 0.0
+
+
 def clear_dir(directory):
+    if not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+        return
     file_list = os.listdir(directory)
     for file in file_list:
         file_path = os.path.join(directory, file)

@@ -520,7 +520,7 @@ class AlignmentLayer(nn.Module):
 
 if __name__ == "__main__":
     #Print Pickle files
-    with open('artifacts/exp_pools/exp_pool.pkl', 'rb') as f:
+    with open('artifacts/exp_pools/test_record_exp_pool.pkl', 'rb') as f:
         exp_pool = pickle.load(f)
     exp_dataset = ExperienceDataset(exp_pool, gamma=1., scale=1000, max_length=20, sample_step=None)
     # exp_dataset_info = Munch(exp_dataset.exp_dataset_info)
@@ -528,10 +528,10 @@ if __name__ == "__main__":
     # pprint(exp_dataset_info)
     #print(dir(exp_pool))
     print("经验池大小:", len(exp_pool))
-    print("动作:", len(exp_pool.actions))
+    print(exp_dataset.states[0].shape)
     # # 打印前 5 条经验（假设每个字段是列表）
     x = 0
-    y = -1
+    y = 0
     i = 47 * x + y  # 选择第 x 条轨迹的第 y 个经验
     print(f"经验 {i}:")
     print("状态:", exp_pool.states[i])

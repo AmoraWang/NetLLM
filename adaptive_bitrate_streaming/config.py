@@ -16,6 +16,10 @@ class Config:
         'fcc-valid': _base_dir + 'data/traces/valid/fcc-valid/',
         'fcc-test': _base_dir + 'data/traces/test/fcc-test/',
         'hsr-test': _base_dir + 'data/traces/test/hsr-test/',
+        'Norway3G-test': _base_dir + 'data/traces/test/Norway3G-test/',
+        'SolisWiFi-test': _base_dir + 'data/traces/test/SolisWiFi-test/',
+        'Lab-test': _base_dir + 'data/traces/test/Lab-test/',
+        'Ghent-test': _base_dir + 'data/traces/test/Ghent-test/',
     }
 
     video_size_dirs = {
