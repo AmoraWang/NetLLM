@@ -45,6 +45,14 @@ class ExperienceDataset(Dataset):
             'min_action': min(self.actions)
         })
 
+        self.has_teacher_logits = getattr(self.exp_pool, 'has_teacher_logits', False)
+        if hasattr(self.exp_pool, 'teacher_logits') and len(self.exp_pool.teacher_logits) not in (0, self.exp_pool_size):
+            raise ValueError(
+                f"teacher_logits length ({len(self.exp_pool.teacher_logits)}) "
+                f"must be 0 or equal to pool size ({self.exp_pool_size})."
+            )
+        self.exp_dataset_info['has_teacher_logits'] = self.has_teacher_logits
+
         self.dataset_indices = list(range(0, self.exp_pool_size - max_length + 1, min(sample_step, max_length)))
     
     def sample_batch(self, batch_size=1, batch_indices=None):
@@ -78,10 +86,29 @@ class ExperienceDataset(Dataset):
     def __len__(self):
         return len(self.dataset_indices)
     
+    @property
+    def teacher_logits(self):
+        return getattr(self.exp_pool, 'teacher_logits', [])
+
     def __getitem__(self, index):
         start = self.dataset_indices[index]
         end = start + self.max_length
-        return self.states[start:end], self.actions[start:end], self.returns[start:end], self.timesteps[start:end]
+        item = (
+            self.states[start:end],
+            self.actions[start:end],
+            self.returns[start:end],
+            self.timesteps[start:end],
+        )
+        if self.has_teacher_logits:
+            tl_window = self.teacher_logits[start:end]
+            # (T, 6) 便于 DataLoader 堆叠为 (B, T, 6)，避免 list of ndarray → object dtype
+            item = item + (
+                np.stack(
+                    [np.asarray(t, dtype=np.float32).reshape(-1) for t in tl_window],
+                    axis=0,
+                ),
+            )
+        return item
 
     def _normalize_rewards(self):
         min_reward, max_reward = min(self.exp_pool.rewards), max(self.exp_pool.rewards)

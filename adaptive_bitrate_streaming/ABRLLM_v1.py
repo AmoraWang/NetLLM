@@ -520,7 +520,7 @@ class AlignmentLayer(nn.Module):
 
 if __name__ == "__main__":
     #Print Pickle files
-    with open('artifacts/exp_pools/test_record_exp_pool.pkl', 'rb') as f:
+    with open('artifacts/exp_pools/exp_pool.pkl', 'rb') as f:
         exp_pool = pickle.load(f)
     exp_dataset = ExperienceDataset(exp_pool, gamma=1., scale=1000, max_length=20, sample_step=None)
     # exp_dataset_info = Munch(exp_dataset.exp_dataset_info)
@@ -538,5 +538,6 @@ if __name__ == "__main__":
     print("动作:", exp_pool.actions[i])
     print("奖励:", exp_pool.rewards[i])
     print("是否结束:", exp_pool.dones[i])
+    print("teacher_logits:", exp_pool.teacher_logits[i])
     print("-" * 40)
     

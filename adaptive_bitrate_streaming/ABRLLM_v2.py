@@ -21,7 +21,7 @@ class ABRLLM(nn.Module):
         #Arguments prepare
         self.args = args
         self.llm_dim = args.llm_dim
-        self.tiny_vocab_size = 1000
+        self.tiny_vocab_size = 2048
         self.state_embedding_dim = args.state_embedding_dim
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.state_use_self_attention = args.state_use_self_attention
@@ -821,7 +821,7 @@ class AlignmentLayer(nn.Module):
         self.out_proj = nn.Linear(key_dim * num_heads, llm_dim)
         self.attention_dropout = nn.Dropout(attention_dropout)
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, return_attn=False, mask_slot_ids=None):
         S = k.shape[0]
         H = self.num_heads
         B, L, _ = q.shape
@@ -829,17 +829,35 @@ class AlignmentLayer(nn.Module):
         q_embeddings = self.q_proj(q).view(B, L, H, -1)
         k_embeddings = self.k_proj(k).view(S, H, -1)
         v_embeddings = self.v_proj(v).view(S, H, -1)
-        cross_attn_embeddings = self.cross_attention(q_embeddings, k_embeddings, v_embeddings)
+        cross_out = self.cross_attention(
+            q_embeddings, k_embeddings, v_embeddings,
+            return_attn=return_attn, mask_slot_ids=mask_slot_ids,
+        )
+        if return_attn:
+            cross_attn_embeddings, attn = cross_out
+        else:
+            cross_attn_embeddings = cross_out
+            attn = None
         cross_attn_embeddings = cross_attn_embeddings.reshape(B, L, -1)
         output = self.out_proj(cross_attn_embeddings)
+        if return_attn:
+            return output, attn
         return output
 
-    def cross_attention(self, q_embeddings, k_embeddings, v_embeddings):
+    def cross_attention(self, q_embeddings, k_embeddings, v_embeddings, return_attn=False, mask_slot_ids=None):
         scale = 1. / (q_embeddings.size(-1) ** 0.5)
         scores = torch.einsum('blhe,she->bhls', q_embeddings, k_embeddings)
-        attn = self.attention_dropout(torch.softmax(scale * scores, dim=-1))  # Fixed: use attention_dropout
+        attn = torch.softmax(scale * scores, dim=-1)
+        if mask_slot_ids is not None:
+            for sid in mask_slot_ids:
+                attn[..., int(sid)] = 0.0
+            attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        if self.training:
+            attn = self.attention_dropout(attn)
         cross_attn_embeddings = torch.einsum('bhls,she->blhe', attn, v_embeddings)
-        return cross_attn_embeddings # (batch_size, seq_len, num_heads, head_dim)
+        if return_attn:
+            return cross_attn_embeddings, attn
+        return cross_attn_embeddings  # (batch_size, seq_len, num_heads, head_dim)
 
 def print_pickle_files():
     with open('artifacts/exp_pools/exp_pool.pkl', 'rb') as f:

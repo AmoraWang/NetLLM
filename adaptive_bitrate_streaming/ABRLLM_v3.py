@@ -13,6 +13,9 @@ from munch import Munch
 from plm_special.data.dataset import ExperienceDataset
 from pprint import pprint
 from plm_special.models.low_rank import peft_model
+from mamba_ssm import Mamba
+
+# ABRLLM_v3：状态张量为 Merina 式 (batch, seq, 11, 6)；StateEncoder 与 v2 共用 6 路分支结构。
 
 class ABRLLM(nn.Module):
     def __init__(self, args):
@@ -20,7 +23,7 @@ class ABRLLM(nn.Module):
         #Arguments prepare
         self.args = args
         self.llm_dim = args.llm_dim
-        self.tiny_vocab_size = 1000
+        self.tiny_vocab_size = 2048
         self.state_embedding_dim = args.state_embedding_dim
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.state_use_self_attention = args.state_use_self_attention
@@ -29,8 +32,21 @@ class ABRLLM(nn.Module):
 
         #self.data_description = "Input sequence: [instruction, (return, state, action) for each timestep]. State: last bitrate, buffer size, past throughput, past download time, next chunk sizes, remaining chunks. Action: bitrate level (0-5). Return: cumulative reward."
         #self.task_description = "Predict bitrate level (0-5) for next chunk to maximize QoE."
-        self.data_description = "The data is a sequence of network states for adaptive bitrate streaming. Each state consists of six features: last bitrate, current buffer size, past k throughput measurements, past k download times, next chunk sizes for different bitrates, and remaining chunks to download."
-        self.task_description = "Based on the given network states, predict the optimal bitrate level for the next video chunk to maximize user Quality of Experience (QoE) by balancing video quality, rebuffering events, and smoothness of playback."
+        #self.data_description = "The data is a sequence of network states for adaptive bitrate streaming. Each state consists of six features: last bitrate, current buffer size, past k throughput measurements, past k download times, next chunk sizes for different bitrates, and remaining chunks to download."
+        #self.task_description = "Based on the given network states, predict the optimal bitrate level for the next video chunk to maximize user Quality of Experience (QoE) by balancing video quality, rebuffering events, and smoothness of playback."
+        self.data_description = (
+            "The input is a multi-modal sequence of networking telemetry. "
+            "Each timestep contains: 1) Cumulative Reward (Return), "
+            "2) Network State in Merina layout (11 × history): throughput, buffer, last bitrate, "
+            "remaining chunks, six rows of per-bitrate next-chunk sizes, download time; "
+            "and 3) Previous Bitrate Decision (Action)."
+        )
+        self.task_description = (
+            "As a Network Optimization Expert, your goal is to analyze these temporal patterns "
+            "and predict the optimal Bitrate Level (0 to 5) for the current segment. "
+            "Prioritize high resolution while strictly avoiding playback stalls and minimizing "
+            "frequent bitrate switching to ensure maximum user Quality of Experience (QoE)."
+        )
         self.max_length = args.max_length
 
         #load llm&tokenizer
@@ -41,18 +57,6 @@ class ABRLLM(nn.Module):
             self.plm, self.tokenizer, self.plm_config = load_plm_qwen3(args.model_path)
         else:
             raise ValueError(f"Unsupported model_type: {args.model_type}")
-        
-        '''TODO: Using origin tokenizer for output'''
-        self.action_words = [" worst", " poor", " fair", " good", " great", " best"]
-        self.action_token_ids = []
-        for w in self.action_words:
-            ids = self.tokenizer.encode(w, add_special_tokens=False)
-            if len(ids) != 1:   
-                print(f"Warning: Word '{w}' splits into multiple tokens: {ids}. Using the last one.")
-            self.action_token_ids.append(ids[-1])
-        print(f"Action Anchor Tokens: {self.action_words} -> IDs: {self.action_token_ids}")
-        # 将 IDs 注册为 buffer，这样它们会自动随模型移动到 GPU，且不会被视为可训练参数
-        self.register_buffer("action_token_indices", torch.tensor(self.action_token_ids, dtype=torch.long))
 
         # Alias for compatibility with training framework
         self.plm_embed_size = self.llm_dim  # For compatibility with training framework
@@ -89,14 +93,13 @@ class ABRLLM(nn.Module):
         
         self.state_encoder = StateEncoder(
             self.state_use_self_attention, 
-            embed_dim=self.state_embedding_dim,
-            hidden_dim=self.state_attn_hidden_dim,
+            embed_dim=self.state_embedding_dim,     #256
+            hidden_dim=self.state_attn_hidden_dim,  #2048
             fusion_method=self.fusion_method
         ).to(self.device)
         self.alignment_layer = AlignmentLayer(alignment_input_dim, args.num_heads, args.key_dim, self.llm_dim).to(self.device)
 
-        '''TODO: Using origin tokenizer for output'''
-        #self.action_projection = nn.Linear(self.llm_dim, BITRATE_LEVELS).to(self.device)
+        self.action_projection = nn.Linear(self.llm_dim, BITRATE_LEVELS).to(self.device)
         
         # modules_except_plm: used for saving/loading modules except PLM (for compatibility with training framework)
         # Note: action_proj_to_llm_dim and return_proj_to_llm_dim are no longer used (alignment_layer handles the conversion)
@@ -108,7 +111,7 @@ class ABRLLM(nn.Module):
             self.timestep_embedding,
             self.mapping_layer,
             self.alignment_layer,
-            #self.action_projection,
+            self.action_projection,
             self.action_proj_to_state_dim,
             self.return_proj_to_state_dim
         ]
@@ -128,7 +131,7 @@ class ABRLLM(nn.Module):
         Forward function for training.
         
         Args:
-            states: (batch_size, seq_len, 6, 6) - network states
+            states: (batch_size, seq_len, 11, 6) - Merina-style network states
             actions: (batch_size, seq_len, 1) - actions (bitrate levels)
             returns: (batch_size, seq_len, 1) - returns (cumulative rewards)
             timesteps: (batch_size, seq_len) - timesteps
@@ -138,7 +141,9 @@ class ABRLLM(nn.Module):
         """
         # Move inputs to device and ensure correct dtype
         # Note: Most modules use float32, only LLM uses bfloat16
-        states = states.to(self.device).float()  # shape: (batch_size, seq_len, 6, 6), dtype: float32
+        states = states.to(self.device).float()  # (batch_size, seq_len, 11, 6)
+        if states.dim() != 4 or states.shape[-2] != 11 or states.shape[-1] != 6:
+            raise ValueError(f"ABRLLM_v3 expects states (B, T, 11, 6), got {tuple(states.shape)}")
         actions = actions.to(self.device).float()  # shape: (batch_size, seq_len, 1), dtype: float32
         returns = returns.to(self.device).float()  # shape: (batch_size, seq_len, 1), dtype: float32
         timesteps = timesteps.to(self.device).long()  # shape: (batch_size, seq_len), dtype: int64 (for Embedding)
@@ -146,10 +151,15 @@ class ABRLLM(nn.Module):
         # Prepare instruction
         #TODO: fix instruction content
         instruction = (
-            f"<|start_prompt|>Data description: {self.data_description}"
-            f" Task description: {self.task_description} "
-            f" Input statistics: "
-            f"<|end_prompt|>"
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            "You are a specialized AI assistant for Adaptive Bitrate (ABR) streaming optimization. "
+            "You will be provided with a sequence of vector embeddings representing (Reward, State, Action) tuples. "
+            "You must interpret these numerical patterns to make real-time bitrate decisions.<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"CONTEXT: {self.data_description}\n"
+            f"OBJECTIVE: {self.task_description}\n"
+            "The embedded sequence follows immediately. Predict the optimal next action (0-5).<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
         instruction = self.tokenizer(instruction, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
         instruction_tokens = instruction.to(self.device).long()  # Ensure long dtype for embedding lookup
@@ -236,21 +246,14 @@ class ABRLLM(nn.Module):
         # Extract outputs corresponding to state positions for action prediction
         # State positions are at: instruction_len + 1, instruction_len + 4, instruction_len + 7, ...
         instruction_len = instruction_embeddings.shape[1]
+        #instruction_len = 0
         state_positions = [instruction_len + 1 + i * 3 for i in range(seq_len)]  # Positions of state embeddings
         state_outputs = output[:, state_positions, :]  # (batch, seq_len, llm_dim), dtype: float32
         
-        '''TODO: Using origin tokenizer for output'''
         # Predict actions
         # state_outputs is already in float32
-        # action_pred = self.action_projection(state_outputs)  # (batch, seq_len, BITRATE_LEVELS), dtype: float32
-        # return action_pred
-        if hasattr(self.plm, 'lm_head'):
-            lm_head_weight = self.plm.lm_head.weight # (vocab_size, hidden_dim)
-        else:
-            raise AttributeError("PLM model does not have 'lm_head' attribute.")
-        anchor_weights = lm_head_weight[self.action_token_indices]
-        action_pred = F.linear(state_outputs, anchor_weights.to(state_outputs.dtype))
-        return action_pred 
+        action_pred = self.action_projection(state_outputs)  # (batch, seq_len, BITRATE_LEVELS), dtype: float32
+        return action_pred
     
     def sample(self, state, target_return, timestep, **kwargs):
         """
@@ -258,7 +261,7 @@ class ABRLLM(nn.Module):
         Compatible with OfflineRLPolicy interface.
         
         Args:
-            state: (1, 1, 6, 6) - current network state
+            state: (1, 1, 11, 6) - current Merina-layout network state
             target_return: float - target return value
             timestep: int - current timestep
         
@@ -271,10 +274,15 @@ class ABRLLM(nn.Module):
         # Step 2: Prepare instruction prompt (same as forward)
         #TODO: fix instruction content
         instruction = (
-            f"<|start_prompt|>Data description: {self.data_description}"
-            f" Task description: {self.task_description} "
-            f" Input statistics: "
-            f"<|end_prompt|>"
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            "You are a specialized AI assistant for Adaptive Bitrate (ABR) streaming optimization. "
+            "You will be provided with a sequence of vector embeddings representing (Reward, State, Action) tuples. "
+            "You must interpret these numerical patterns to make real-time bitrate decisions.<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"CONTEXT: {self.data_description}\n"
+            f"OBJECTIVE: {self.task_description}\n"
+            "The embedded sequence follows immediately. Predict the optimal next action (0-5).<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
         instruction = self.tokenizer(instruction, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
         instruction_tokens = instruction.to(self.device).long()
@@ -295,7 +303,7 @@ class ABRLLM(nn.Module):
         return_emb_for_state = self.return_proj_to_state_dim(return_emb_llm)  # (1, 1, state_embedding_dim)
         
         # Step 5: Process state with return embedding (no action yet, as we're predicting it)
-        state = state.to(self.device).float()  # (1, 1, 6, 6)
+        state = state.to(self.device).float()  # (1, 1, 11, 6)
         encoder_output = self.state_encoder(state, action_embedding=None, return_embedding=return_emb_for_state)
         
         # Handle different return formats
@@ -360,14 +368,8 @@ class ABRLLM(nn.Module):
         # Step 8: Predict action from the last state position
         # The last position corresponds to the state embedding we just added
         logits_used = output[:, -1:, :]  # (1, 1, llm_dim) - use last position (state embedding), dtype: float32
-        # Use lm_head anchor weights (same as forward method)
-        if hasattr(self.plm, 'lm_head'):
-            lm_head_weight = self.plm.lm_head.weight  # (vocab_size, hidden_dim)
-        else:
-            raise AttributeError("PLM model does not have 'lm_head' attribute.")
-        anchor_weights = lm_head_weight[self.action_token_indices]
-        action_pred = F.linear(logits_used, anchor_weights.to(logits_used.dtype))  # (1, 1, BITRATE_LEVELS)
-        action_pred = action_pred.reshape(-1)  # (BITRATE_LEVELS,)
+        action_pred = self.action_projection(logits_used)  # (1, 1, BITRATE_LEVELS), dtype: float32
+        action_pred = action_pred.reshape(-1) # (BITRATE_LEVELS,)
         
         # Sample action
         bitrate, _ = self._sample(action_pred)
@@ -448,7 +450,7 @@ class ABRLLM(nn.Module):
     # def get_tokenizer_size(self):
     #     return self.word_embeddings.shape
     # def get_state_size(self):
-    #     a=torch.rand(1, 10, 6, 6)
+    #     a=torch.rand(1, 10, 11, 6)
     #     features = self.state_encoder(a)
     #     return features[0].shape, features[1].shape, features[2].shape, features[3].shape, features[4].shape, features[5].shape
     # def get_timestep_size(self):
@@ -473,7 +475,7 @@ class ABRLLM(nn.Module):
     # def test_forward(self):
     #     batch_size = 1
     #     seq_len = 10
-    #     states = torch.rand((batch_size, seq_len, 6, 6), dtype=torch.float32)
+    #     states = torch.rand((batch_size, seq_len, 11, 6), dtype=torch.float32)
     #     actions = torch.randint(0, BITRATE_LEVELS, (batch_size, seq_len, 1), dtype=torch.float32)
     #     returns = torch.rand((batch_size, seq_len, 1), dtype=torch.float32)
     #     timesteps = torch.randint(0, 100, (batch_size, seq_len), dtype=torch.long)
@@ -501,18 +503,25 @@ class StateEncoder(nn.Module):
 
         # Self-attention layer that fuses 6 features into a single hidden representation
         if self.use_self_attention:
-            self.state_attention = StateFeatureSelfAttention(
-                embed_dim=embed_dim, 
-                hidden_dim=self.hidden_dim,
-                num_heads=num_heads,
-                fusion_method=fusion_method
-            )
+            if fusion_method == 'mamba':
+                self.state_attention = MambaStateFeatureEncoder(
+                    embed_dim=embed_dim,
+                    hidden_dim=self.hidden_dim,
+                    d_state=16 # SSM 内部状态维度
+                )
+            else:
+                self.state_attention = StateFeatureSelfAttention(
+                    embed_dim=embed_dim, 
+                    hidden_dim=self.hidden_dim,
+                    num_heads=num_heads,
+                    fusion_method=fusion_method
+                )
 
 
     def forward(self, state, action_embedding=None, return_embedding=None):
         """
         Args:
-            state: (batch_size, seq_len, 6, 6) - network states
+            state: (batch_size, seq_len, 11, 6) - Merina-style network states
             action_embedding: (batch_size, seq_len, embed_dim) or None - action embeddings
             return_embedding: (batch_size, seq_len, embed_dim) or None - return embeddings
         Returns:
@@ -521,16 +530,17 @@ class StateEncoder(nn.Module):
             Else:
                 features1, features2, features3, features4, features5, features6 - 6 separate state features
         """
-        # state.shape: (batch_size, seq_len, 6, 6) -> (batch_size x seq_len, 6, 6)
+        # (batch_size, seq_len, 11, 6) -> (batch_size * seq_len, 11, 6)
         batch_size, seq_len = state.shape[0], state.shape[1]
-        state = state.reshape(batch_size * seq_len, 6, 6)
-        
-        last_bitrate = state[..., 0:1, -1]
-        current_buffer_size = state[..., 1:2, -1]
-        throughputs = state[..., 2:3, :]
-        download_time = state[..., 3:4, :]
-        next_chunk_size = state[..., 4:5, :BITRATE_LEVELS]
-        remain_chunks = state[..., 5:6, -1]
+        state = state.reshape(batch_size * seq_len, 11, 6)
+
+        # Merina 行序 -> 与 v2 相同的 6 个分支（吞吐/缓冲/码率/剩余/各档 next size / 时延）
+        throughputs = state[:, 0:1, :]
+        current_buffer_size = state[:, 1:2, -1]
+        last_bitrate = state[:, 2:3, -1]
+        remain_chunks = state[:, 3:4, -1]
+        next_chunk_size = state[:, 4:10, -1].unsqueeze(1)  # (N, 1, 6) 六档下一分片（当前列）
+        download_time = state[:, 10:11, :]
 
         features1 = self.fc1(last_bitrate).reshape(batch_size, seq_len, -1)
         features2 = self.fc2(current_buffer_size).reshape(batch_size, seq_len, -1)
@@ -737,6 +747,69 @@ class StateFeatureSelfAttention(nn.Module):
             return_emb = self.fusion_activation(return_emb)
             return_emb = return_emb.view(batch_size, seq_len, self.hidden_dim)
         
+        return state_emb, action_emb, return_emb
+
+class MambaStateFeatureEncoder(nn.Module):
+    def __init__(self, embed_dim, hidden_dim=None, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else embed_dim
+        
+        # 使用 Mamba 替代 Self-Attention
+        # d_model: 输入维度
+        # d_state: SSM 状态维度，类似于 RNN 的 hidden state 维度
+        # d_conv: 局部卷积核大小，用于捕捉相邻特征的局部相关性
+        self.mamba = Mamba(
+            d_model=embed_dim, 
+            d_state=d_state, 
+            d_conv=d_conv, 
+            expand=expand
+        )
+        
+        # 融合后的投影层，保持与原结构输出一致
+        self.state_fusion_proj = nn.Linear(embed_dim, self.hidden_dim)
+        self.action_proj = nn.Linear(embed_dim, self.hidden_dim)
+        self.return_proj = nn.Linear(embed_dim, self.hidden_dim)
+        
+        self.fusion_norm = nn.LayerNorm(self.hidden_dim)
+        self.fusion_activation = nn.LeakyReLU()
+
+    def forward(self, state_features, action_embedding=None, return_embedding=None):
+        # state_features: List of 6 tensors (batch_size, seq_len, embed_dim)
+        batch_size, seq_len = state_features[0].shape[:2]
+        
+        # 1. 组装序列：[F1, F2, F3, F4, F5, F6, Action, Return]
+        # 将特征堆叠为 (batch_size * seq_len, num_features, embed_dim)
+        all_feats = [f.reshape(-1, 1, self.embed_dim) for f in state_features]
+        if action_embedding is not None:
+            all_feats.append(action_embedding.reshape(-1, 1, self.embed_dim))
+        if return_embedding is not None:
+            all_feats.append(return_embedding.reshape(-1, 1, self.embed_dim))
+            
+        stacked_sequence = torch.cat(all_feats, dim=1) # (B*L, N, D)
+        
+        # 2. Mamba 线性扫描处理
+        # 相比 Attention，Mamba 随特征数量 N 呈线性增加复杂度
+        mamba_output = self.mamba(stacked_sequence) # (B*L, N, D)
+        
+        # 3. 提取与融合 (模拟原代码逻辑)
+        # 提取前 6 个属于 state 的特征进行平均池化（或加权）
+        state_enhanced = mamba_output[:, :6, :].mean(dim=1) 
+        state_emb = self.fusion_norm(self.fusion_activation(self.state_fusion_proj(state_enhanced)))
+        state_emb = state_emb.view(batch_size, seq_len, -1)
+        
+        # 提取 Action 和 Return 对应的位置
+        action_emb = None
+        if action_embedding is not None:
+            action_enhanced = mamba_output[:, 6, :]
+            action_emb = self.action_proj(action_enhanced).view(batch_size, seq_len, -1)
+            
+        return_emb = None
+        if return_embedding is not None:
+            return_idx = 7 if action_embedding is not None else 6
+            return_enhanced = mamba_output[:, return_idx, :]
+            return_emb = self.return_proj(return_enhanced).view(batch_size, seq_len, -1)
+
         return state_emb, action_emb, return_emb
 
 class AlignmentLayer(nn.Module):

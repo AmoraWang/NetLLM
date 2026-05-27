@@ -17,11 +17,16 @@ NOISE_HIGH = 1.1
 
 class Environment:
     def __init__(self, all_cooked_time, all_cooked_bw, all_file_names=None, all_mahimahi_ptrs=None, 
-                 video_size_dir=None, fixed=False, trace_num=100, **kwargs):
+                 video_size_dir=None, fixed=False, trace_num=100, numpy_random_seed=None, **kwargs):
         assert len(all_cooked_time) == len(all_cooked_bw)
         assert trace_num > 0
 
-        np.random.seed(RANDOM_SEED)
+        # numpy_random_seed=None 保持与原 Pensieve 行为一致（固定常量）；传入整数则每条 trace 上
+        # np.random.randint(1, len) 的起始点在多轮测试中可各不相同。
+        if numpy_random_seed is not None:
+            np.random.seed(int(numpy_random_seed) % (2 ** 32))
+        else:
+            np.random.seed(RANDOM_SEED)
         self.fixed = fixed
         self.all_cooked_time = all_cooked_time
         self.all_cooked_bw = all_cooked_bw
@@ -54,7 +59,7 @@ class Environment:
         # note: trace file starts with time 0
         self.mahimahi_iter = 0
         self.mahimahi_ptr = self.mahimahi_ptrs[self.mahimahi_iter]
-        self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr - 1]
+        self._clamp_mahimahi_to_current_trace()
 
         self.video_size = {}  # in bytes
         for bitrate in range(BITRATE_LEVELS):
@@ -62,6 +67,26 @@ class Environment:
             with open(video_size_dir + 'video_size_' + str(bitrate)) as f:
                 for line in f:
                     self.video_size[bitrate].append(int(line.split()[0]))
+
+    def _clamp_mahimahi_to_current_trace(self):
+        """
+        将 mahimahi_ptr 限制在当前 cooked 序列合法范围内。
+
+        ``load_traces`` 若从目录中读入 ``*.pkl`` 的 ``all_mahimahi_ptrs``，指针可能针对
+        更长或不同版本的轨迹；换 trace 时会出现 ``mahimahi_ptr >= len(cooked_time)``
+        导致 ``cooked_time[mahimahi_ptr - 1]`` 越界。此处与 Pensieve 一致，强制
+        ``ptr ∈ [1, len-1]``（至少 2 个采样点），并同步 ``last_mahimahi_time``。
+        """
+        n_bw = len(self.cooked_bw)
+        n_tm = len(self.cooked_time)
+        n = min(n_bw, n_tm)
+        if n < 2:
+            self.mahimahi_ptr = 0
+            self.last_mahimahi_time = float(self.cooked_time[0]) if n_tm else 0.0
+            return
+        p = max(1, min(int(self.mahimahi_ptr), n - 1))
+        self.mahimahi_ptr = p
+        self.last_mahimahi_time = self.cooked_time[p - 1]
 
     def get_video_chunk(self, quality):
 
@@ -172,7 +197,7 @@ class Environment:
             # note: trace file starts with time 0
             self.mahimahi_iter = (self.mahimahi_iter + 1) % self.trace_num
             self.mahimahi_ptr = self.mahimahi_ptrs[self.mahimahi_iter]
-            self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr - 1]
+            self._clamp_mahimahi_to_current_trace()
 
         next_video_chunk_sizes = []
         for i in range(BITRATE_LEVELS):

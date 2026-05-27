@@ -1,8 +1,11 @@
 import os
 
+# 始终以本文件所在目录为 adaptive_bitrate_streaming 包根（与 cwd、run/ 下执行无关）
+_ABR_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 
 class Config:
-    _base_dir = '' if 'adaptive_bitrate_streaming' in os.getcwd() else 'adaptive_bitrate_streaming/'
+    _base_dir = _ABR_PACKAGE_ROOT + os.sep
     baseline_model_paths = {
         'genet': _base_dir + 'data/all_models/genet/nn_model_ep_9900.ckpt',
         'udr_1': _base_dir + 'data/all_models/udr_1/nn_model_ep_57600.ckpt',
@@ -18,8 +21,22 @@ class Config:
         'hsr-test': _base_dir + 'data/traces/test/hsr-test/',
         'Norway3G-test': _base_dir + 'data/traces/test/Norway3G-test/',
         'SolisWiFi-test': _base_dir + 'data/traces/test/SolisWiFi-test/',
+        'SolisWiFi-train': _base_dir + 'data/traces/train/SolisWiFi-train/',
         'Lab-test': _base_dir + 'data/traces/test/Lab-test/',
         'Ghent-test': _base_dir + 'data/traces/test/Ghent-test/',
+        'fcc_hsdpa_cooked_test_traces': _base_dir + 'data/traces/test/fcc_hsdpa_cooked_test_traces/',
+        'fcc_hsdpa_cooked_traces': _base_dir + 'data/traces/train/fcc_hsdpa_cooked_traces/',
+        'fcc_hsdpa_test_traces': _base_dir + 'data/traces/test/fcc_hsdpa_test_traces/',
+        'fcc16-test': _base_dir + 'data/traces/test/fcc16-test/',
+        'fcc16-train': _base_dir + 'data/traces/train/fcc16-train/',
+        'fcc18-test': _base_dir + 'data/traces/test/fcc18-test/',
+        'fcc18-train': _base_dir + 'data/traces/train/fcc18-train/',
+        'Puffer22-test': _base_dir + 'data/traces/test/Puffer22-test/',
+        'Puffer22-train': _base_dir + 'data/traces/train/Puffer22-train/',
+        'Puffer21-test': _base_dir + 'data/traces/test/Puffer21-test/',
+        'Puffer21-train': _base_dir + 'data/traces/train/Puffer21-train/',
+        'Oboe-test': _base_dir + 'data/traces/test/Oboe-test/',
+        'Oboe-train': _base_dir + 'data/traces/train/Oboe-train/',
     }
 
     video_size_dirs = {
@@ -36,7 +53,7 @@ class Config:
     plm_types = ['gpt2', 'llama', 'llava', 't5-lm', 'opt', 'mistral', 'qwen']
     plm_sizes = ['xxs', 'xs', 'small', 'base', 'large', 'xl', 'xxl', '2_7b']  # note that the actual size of plm is dependent on the type of plm. 
                                                          # for example, for llama, 'base' is 7b, while for gpt2, 'base' is 340M. you can specify it yourself.
-    plm_dir = _base_dir + ('../../downloaded_plms' if 'adaptive_bitrate_streaming' in _base_dir else '../downloaded_plms')
+    plm_dir = os.path.join(os.path.dirname(_ABR_PACKAGE_ROOT), 'downloaded_plms')
     plm_ft_dir = _base_dir + 'data/ft_plms'
     plm_embed_sizes = {
         'gpt2': {
