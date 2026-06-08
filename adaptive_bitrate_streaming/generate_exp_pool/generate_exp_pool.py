@@ -16,7 +16,6 @@ from baseline_special.utils.utils import load_traces
 from baseline_special.utils.constants import (
     REBUF_PENALTY, SMOOTH_PENALTY, DEFAULT_QUALITY, S_INFO, S_LEN, A_DIM, BITRATE_LEVELS, BUFFER_NORM_FACTOR,
     M_IN_K, SMOOTH_PENALTY, VIDEO_BIT_RATE, CHUNK_TIL_VIDEO_END_CAP, RAND_RANGE, DEFAULT_QUALITY, TOTAL_VIDEO_CHUNK,
-    ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN,
 )
 from plm_special.utils.utils import action2bitrate
 from plm_special.data.exp_pool import ExperiencePool
@@ -252,10 +251,7 @@ def collect_experience(args, model, model_name, env_settings, trace_num, sess, a
     time_stamp = 0
     last_bit_rate = DEFAULT_QUALITY
     bit_rate = DEFAULT_QUALITY
-    use_v3 = getattr(args, 'abr_llm_version', 'v2') == 'v3'
-    si, sl = (ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN) if use_v3 else (S_INFO, S_LEN)
-    state = np.zeros((si, sl), dtype=np.float32)
-    # Pensieve / MPC / BBA 仍按 (6,6) 读状态；v3 时在并行维护一份 Merina (11,6) 写入经验池
+    state = np.zeros((S_INFO, S_LEN), dtype=np.float32)
     state_policy = np.zeros((S_INFO, S_LEN), dtype=np.float32)
     test_trace_count = 0
     all_rewards  = []
@@ -281,38 +277,14 @@ def collect_experience(args, model, model_name, env_settings, trace_num, sess, a
         dones.append(end_of_video)
         all_rewards.append(reward)  # for debug use
 
-        # dequeue history record
-        if use_v3:
-            state = np.roll(state, -1, axis=1)
-            safe_d = max(float(delay), 1e-6)
-            state[0, -1] = float(video_chunk_size) / safe_d / M_IN_K
-            state[1, -1] = buffer_size / BUFFER_NORM_FACTOR
-            state[2, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))
-            state[3, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
-            sz = np.array(next_video_chunk_sizes, dtype=np.float64) / M_IN_K / M_IN_K
-            for i in range(BITRATE_LEVELS):
-                state[4 + i, -1] = sz[i]
-            state[10, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR
-            state_policy = np.roll(state_policy, -1, axis=1)
-            state_policy[0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))
-            state_policy[1, -1] = buffer_size / BUFFER_NORM_FACTOR
-            state_policy[2, -1] = float(video_chunk_size) / safe_d / M_IN_K
-            state_policy[3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR
-            state_policy[4, :BITRATE_LEVELS] = np.array(next_video_chunk_sizes) / M_IN_K / M_IN_K
-            state_policy[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
-        else:
-            state = np.roll(state, -1, axis=1)
-
-            # this should be S_INFO number of terms
-            state[0, -1] = VIDEO_BIT_RATE[bit_rate] / \
-                            float(np.max(VIDEO_BIT_RATE))  # last quality
-            state[1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 10 sec
-            state[2, -1] = float(video_chunk_size) / \
-                            float(delay) / M_IN_K  # kilo byte / ms
-            state[3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR  # 10 sec
-            state[4, :BITRATE_LEVELS] = np.array(next_video_chunk_sizes) / M_IN_K / M_IN_K  # mega byte
-            state[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
-            state_policy = state
+        state = np.roll(state, -1, axis=1)
+        state[0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))
+        state[1, -1] = buffer_size / BUFFER_NORM_FACTOR
+        state[2, -1] = float(video_chunk_size) / float(delay) / M_IN_K
+        state[3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR
+        state[4, :BITRATE_LEVELS] = np.array(next_video_chunk_sizes) / M_IN_K / M_IN_K
+        state[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
+        state_policy = state
 
         if model == PENSIEVE:
             bit_rate = pensieve(actor, state_policy, last_bit_rate)
@@ -325,7 +297,7 @@ def collect_experience(args, model, model_name, env_settings, trace_num, sess, a
         if end_of_video:
             last_bit_rate = DEFAULT_QUALITY
             bit_rate = DEFAULT_QUALITY
-            state = np.zeros((si, sl), dtype=np.float32)
+            state = np.zeros((S_INFO, S_LEN), dtype=np.float32)
             state_policy = np.zeros((S_INFO, S_LEN), dtype=np.float32)
 
             total_states.extend(states[1:])
@@ -419,7 +391,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, help='random seed', default=100003)
     parser.add_argument('--cuda-id', type=int, help='cuda device idx', default=0)
     parser.add_argument('--abr-llm-version', type=str, choices=('v2', 'v3'), default='v2',
-                        help='经验池状态布局：v2=(6,6) Pensieve；v3=(11,6) Merina 行序（与 GENET 并存时仍用 6x6 驱动策略）')
+                        help='仅影响输出目录名 abr_v2/abr_v3；状态均为 NetLLM (6,6)，与 --abr-llm-version 训练模型对应')
     args = parser.parse_args()
 
     # >>> debug <<<

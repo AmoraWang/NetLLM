@@ -6,10 +6,8 @@ from baseline_special.env import Environment
 from baseline_special.utils.constants import (
     REBUF_PENALTY, SMOOTH_PENALTY, DEFAULT_QUALITY, S_INFO, S_LEN, BITRATE_LEVELS, BUFFER_NORM_FACTOR,
     M_IN_K, SMOOTH_PENALTY, VIDEO_BIT_RATE, CHUNK_TIL_VIDEO_END_CAP, MAX_VIDEO_BIT_RATE, DEFAULT_QUALITY,
-    ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN,
 )
 from plm_special.utils.utils import set_random_seed
-from plm_special.utils.merina_abr_state import merina_abr_apply_state_step_torch
 
 
 def evaluate_on_env(args, env_settings, model, target_return, max_ep_num=50, process_reward_fn=None, seed=0):
@@ -24,9 +22,7 @@ def evaluate_on_env(args, env_settings, model, target_return, max_ep_num=50, pro
         
         last_bit_rate = DEFAULT_QUALITY
         bit_rate = DEFAULT_QUALITY
-        use_v3 = getattr(args, 'abr_llm_version', 'v2') == 'v3'
-        si, sl = (ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN) if use_v3 else (S_INFO, S_LEN)
-        state = torch.zeros((1, 1, si, sl), dtype=torch.float32, device=args.device)
+        state = torch.zeros((1, 1, S_INFO, S_LEN), dtype=torch.float32, device=args.device)
         timestep = 0
         target_return_clone = copy.deepcopy(target_return)
         ep_count = 0
@@ -47,19 +43,15 @@ def evaluate_on_env(args, env_settings, model, target_return, max_ep_num=50, pro
             last_bit_rate = bit_rate
 
             # dequeue history record
-            if use_v3:
-                merina_abr_apply_state_step_torch(
-                    state, bit_rate, delay, buffer_size, video_chunk_size,
-                    next_video_chunk_sizes, video_chunk_remain,
-                )
-            else:
-                state = torch.roll(state, -1, dims=-1)
-                state[..., 0, -1] = VIDEO_BIT_RATE[bit_rate] / MAX_VIDEO_BIT_RATE # last quality
-                state[..., 1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 10 sec
-                state[..., 2, -1] = video_chunk_size / delay / M_IN_K  # kilo byte / ms
-                state[..., 3, -1] = delay / M_IN_K / BUFFER_NORM_FACTOR  # 10 sec
-                state[..., 4, :BITRATE_LEVELS] = torch.as_tensor(next_video_chunk_sizes, device=args.device, dtype=torch.float32) / M_IN_K / M_IN_K  # mega byte
-                state[..., 5, -1] = min(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / CHUNK_TIL_VIDEO_END_CAP
+            state = torch.roll(state, -1, dims=-1)
+            state[..., 0, -1] = VIDEO_BIT_RATE[bit_rate] / MAX_VIDEO_BIT_RATE
+            state[..., 1, -1] = buffer_size / BUFFER_NORM_FACTOR
+            state[..., 2, -1] = video_chunk_size / delay / M_IN_K
+            state[..., 3, -1] = delay / M_IN_K / BUFFER_NORM_FACTOR
+            state[..., 4, :BITRATE_LEVELS] = torch.as_tensor(
+                next_video_chunk_sizes, device=args.device, dtype=torch.float32
+            ) / M_IN_K / M_IN_K
+            state[..., 5, -1] = min(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / CHUNK_TIL_VIDEO_END_CAP
 
             if timestep > 0:  # skip the first reward like pensieve
                 reward = process_reward_fn(reward)

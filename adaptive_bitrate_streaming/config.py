@@ -37,6 +37,17 @@ class Config:
         'Puffer21-train': _base_dir + 'data/traces/train/Puffer21-train/',
         'Oboe-test': _base_dir + 'data/traces/test/Oboe-test/',
         'Oboe-train': _base_dir + 'data/traces/train/Oboe-train/',
+        '1s-test': _base_dir + 'data/traces/test/1s-test/',
+        '1s-train': _base_dir + 'data/traces/train/1s-train/',
+        '1s-valid': _base_dir + 'data/traces/valid/1s-valid/',
+        '5s-test': _base_dir + 'data/traces/test/5s-test/',
+        '5s-train': _base_dir + 'data/traces/train/5s-train/',
+        '5s-valid': _base_dir + 'data/traces/valid/5s-valid/',
+        'irregular-test': _base_dir + 'data/traces/test/irregular-test/',
+        'irregular-train': _base_dir + 'data/traces/train/irregular-train/',
+        'irregular-valid': _base_dir + 'data/traces/valid/irregular-valid/',
+        'Lumos4G-test': _base_dir + 'data/traces/test/Lumos4G-test/',
+        'Lumos5G-test': _base_dir + 'data/traces/test/Lumos5G-test/',
     }
 
     video_size_dirs = {

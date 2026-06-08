@@ -8,7 +8,6 @@ DEFAULT_PLOT_ALGOS: tuple[str, ...] = (
     "BOLA",
     "RobustMPC",
     "Pensieve",
-    "MERINA",
     "Comyco",
     "Oracle",
 )
@@ -34,6 +33,16 @@ DEFAULT_BASELINE_ALGOS: tuple[str, ...] = tuple(
 
 def algo_display_name(key: str) -> str:
     return ALGO_DISPLAY_NAMES.get(key, key)
+
+
+def is_plot_excluded_algo(name: str) -> bool:
+    """绘图时跳过 Merina（collect 仍可保留 merina .pt）。"""
+    return name.lower() == "merina"
+
+
+def filter_plot_algos(data: dict) -> dict:
+    """去掉不参与绘图的算法。"""
+    return {k: v for k, v in data.items() if not is_plot_excluded_algo(k)}
 
 
 def order_algo_dict(data: dict, *, order: tuple[str, ...] = DEFAULT_PLOT_ALGOS) -> dict:

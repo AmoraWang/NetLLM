@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-可视化 ABRLLM_v2 的 Reprogramming + Alignment（网络语义 ↔ LLM 语义对齐）。
+可视化 ABRLLM v2/v3 的 Reprogramming + Alignment（网络语义 ↔ LLM 语义对齐）。
 
 「槽位 (slot)」是什么？
   mapping_layer 把 LLM 全词表 (约 12.8 万 token) 压缩成 tiny_vocab_size=2048 个
@@ -38,11 +38,9 @@ if _ABR_ROOT not in sys.path:
 import numpy as np
 import torch
 
-from config import cfg
 from plm_special.data.dataset import ExperienceDataset
-from plm_special.models.low_rank import peft_model
 from plm_special.utils.utils import set_random_seed
-from run.run_abr import load_model
+from run.abr_viz_common import build_abrllm, patch_viz_args
 
 try:
     import matplotlib.pyplot as plt
@@ -320,7 +318,7 @@ def _write_dashboard(
     page = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>ABR Alignment Dashboard</title></head>
 <body>
-<h1>ABRLLM_v2 语义对齐可视化</h1>
+<h1>ABRLLM 语义对齐可视化</h1>
 <pre>{html.escape(HOW_TO_READ)}</pre>
 <h2>热力图 (Top 槽位 × 时间)</h2>
 <img src="{html.escape(heatmap_name)}" width="1000"/>
@@ -337,7 +335,7 @@ def _write_dashboard(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize ABRLLM_v2 alignment / reprogramming slots")
+    parser = argparse.ArgumentParser(description="Visualize ABRLLM v2/v3 alignment / reprogramming slots")
     parser.add_argument("--model-dir", required=True, help="best_model 或 checkpoint 目录")
     parser.add_argument("--exp-pool-path", required=True, help="经验池 pickle")
     parser.add_argument("--sample-index", type=int, default=0, help="ExperienceDataset 样本下标")
@@ -350,7 +348,15 @@ def main():
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--scale", type=int, default=1000)
     parser.add_argument("--sample-step", type=int, default=None)
-    parser.add_argument("--state-feature-dim", type=int, default=512)
+    parser.add_argument(
+        "--abr-llm-version",
+        choices=("v2", "v3"),
+        default="v2",
+        help="须与 checkpoint 一致；v3 含 contrast_proj，不可用 v2 类加载 v3 权重",
+    )
+    parser.add_argument("--contrast-dim", type=int, default=256, help="v3 对比 MLP 输出维，与训练 --contrast-dim 一致")
+    parser.add_argument("--align-lambda", type=float, default=0.1, help="仅影响 v3 模型是否构建 contrast_proj（与训练一致即可）")
+    parser.add_argument("--state-feature-dim", type=int, default=256)
     parser.add_argument("--state-attn-hidden-dim", type=int, default=2048)
     parser.add_argument("--state-use-self-attention", action="store_true", default=True)
     parser.add_argument("--fusion-method", default="weighted_sum")
@@ -361,15 +367,7 @@ def main():
     parser.add_argument("--seed", type=int, default=666)
     args = parser.parse_args()
 
-    if args.sample_step is None:
-        args.sample_step = args.w
-    if args.device is None:
-        args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    args.state_embedding_dim = args.state_feature_dim
-    args.abr_llm_version = "v2"
-    args.model_path = os.path.join(cfg.plm_dir, args.plm_type, args.plm_size)
-    args.llm_dim = cfg.plm_embed_sizes[args.plm_type][args.plm_size]
-    args.max_length = args.w
+    patch_viz_args(args)
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "HOW_TO_READ.txt"), "w", encoding="utf-8") as f:
@@ -385,8 +383,6 @@ def main():
         )
 
     set_random_seed(args.seed)
-
-    from ABRLLM_v2 import ABRLLM
 
     exp_pool = pickle.load(open(args.exp_pool_path, "rb"))
     dataset = ExperienceDataset(
@@ -404,13 +400,7 @@ def main():
     actions_t = torch.tensor(actions, dtype=torch.float32).reshape(1, -1, 1)
     returns_t = torch.tensor(returns, dtype=torch.float32).reshape(1, -1, 1)
 
-    model = ABRLLM(args)
-    model.device = torch.device(args.device)
-    model = model.to(args.device)
-    if args.rank > 0:
-        model.plm = peft_model(model.plm, args.plm_type, rank=args.rank)
-    model = load_model(args, model, args.model_dir)
-    model.eval()
+    model = build_abrllm(args, load_weights=True)
 
     state_emb, tiny_vocab = _encode_state_query(model, states_t, actions_t, returns_t)
     attn_ls = _alignment_attn(model, state_emb, tiny_vocab)  # (L, S)

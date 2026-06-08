@@ -14,9 +14,6 @@ BITRATE_LEVELS = 6
 S_INFO = 6
 S_LEN = 6  # take how many frames in the past
 
-# ABRLLM_v3：与 Merina test_v5 相同的 11 行语义，最后一维为历史长度（默认 6）
-ABRLLM_V3_S_INFO = 11
-ABRLLM_V3_S_LEN = 6
 # jump-action dim
 A_DIM = 3
 ACTOR_LR_RATE = 0.0001

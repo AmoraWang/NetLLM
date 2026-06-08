@@ -35,11 +35,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from config import cfg
+from baseline_special.utils.constants import M_IN_K, REBUF_PENALTY, SMOOTH_PENALTY
 
 from run.plot_algo_defaults import (
     DEFAULT_PLOT_ALGOS,
     algo_display_name,
     filter_algo_dirs,
+    filter_plot_algos,
+    is_plot_excluded_algo,
     order_algo_dict,
 )
 
@@ -64,6 +67,112 @@ TRACE_KEY_PREFIXES = (
     "log_test_merina_",
 )
 DEFAULT_NUM_BINS = 500
+
+QOE_COMPONENT_KEYS = (
+    "quality",
+    "rebuffer_penalty",
+    "smoothness_penalty",
+)
+
+
+def parse_line_qoe_components(parts: list[str]) -> tuple[float, float, float, float] | None:
+    """
+    从日志行解析 QoE 三分量与总 reward。
+
+    NetLLM 8 列：time bit_rate buffer rebuf chunk_size delay smoothness reward
+      - quality = bit_rate / M_IN_K
+      - rebuffer_penalty = REBUF_PENALTY * rebuf
+      - smoothness_penalty = SMOOTH_PENALTY * smoothness
+    Merina/Comyco 7 列：无 smoothness 列，由 reward 反推 smoothness_penalty。
+    """
+    if len(parts) < 7:
+        return None
+    try:
+        bit_rate = float(parts[1])
+        rebuf = float(parts[3])
+        quality = bit_rate / M_IN_K
+        rebuffer_penalty = REBUF_PENALTY * rebuf
+        if len(parts) >= 8:
+            smoothness_diff = float(parts[6])
+            reward = float(parts[7])
+            smoothness_penalty = SMOOTH_PENALTY * smoothness_diff
+        else:
+            reward = float(parts[6])
+            smoothness_penalty = quality - rebuffer_penalty - reward
+        return quality, rebuffer_penalty, smoothness_penalty, reward
+    except ValueError:
+        return None
+
+
+def read_all_chunk_qoe_components(path: str) -> list[tuple[float, float, float, float]]:
+    """每条 chunk 一行：(quality, rebuffer_penalty, smoothness_penalty, reward)。"""
+    rows: list[tuple[float, float, float, float]] = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parsed = parse_line_qoe_components(line.split())
+            if parsed is not None:
+                rows.append(parsed)
+    return rows
+
+
+def _apply_chunk_skip(
+    rows: list[tuple[float, float, float, float]],
+    *,
+    skip_first: bool,
+    skip_last: bool,
+) -> list[tuple[float, float, float, float]]:
+    if skip_first and rows:
+        rows = rows[1:]
+    if skip_last and rows:
+        rows = rows[:-1]
+    return rows
+
+
+def trace_mean_qoe_components_from_file(
+    path: str,
+    *,
+    skip_first_chunk: bool = True,
+    skip_last_chunk: bool = False,
+) -> tuple[float, float, float, float] | None:
+    """单条 trace 上各 QoE 分量与总 reward 的 chunk 均值。"""
+    rows = _apply_chunk_skip(
+        read_all_chunk_qoe_components(path),
+        skip_first=skip_first_chunk,
+        skip_last=skip_last_chunk,
+    )
+    if not rows:
+        return None
+    arr = np.asarray(rows, dtype=np.float64)
+    return tuple(float(x) for x in arr.mean(axis=0))
+
+
+def collect_trace_mean_qoe_components_by_key(
+    log_root: str,
+    *,
+    skip_first_chunk: bool = True,
+    skip_last_chunk: bool = False,
+) -> dict[str, tuple[float, float, float, float]]:
+    """
+    每条 trace → (mean_quality, mean_rebuffer_penalty,
+                  mean_smoothness_penalty, mean_reward)。
+    """
+    files = find_log_files(log_root)
+    if not files:
+        raise FileNotFoundError(
+            f"在 {log_root!r} 下未找到测试结果日志（需含 {LOG_NAME_HINTS} 的文件名）"
+        )
+    out: dict[str, tuple[float, float, float, float]] = {}
+    for fp in files:
+        m = trace_mean_qoe_components_from_file(
+            fp,
+            skip_first_chunk=skip_first_chunk,
+            skip_last_chunk=skip_last_chunk,
+        )
+        if m is not None:
+            out[trace_key_from_log_path(fp)] = m
+    if not out:
+        raise ValueError(f"{log_root!r} 中无法计算 trace 平均 QoE 分量")
+    return out
 
 
 def trace_key_from_log_path(path: str) -> str:
@@ -416,6 +525,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="ABRLLM 测试结果目录，图例标注为 Ours（可与 --preset 联用）",
     )
+    parser.add_argument(
+        "--qoe-pt-dir",
+        "--qoe-tensordict",
+        dest="qoe_pt_dir",
+        default=None,
+        help="collect_qoe_cdf_columns.py 输出的目录（读取 {trace}_{algo}.pt）",
+    )
     parser.add_argument("--output", "-o", default="artifacts/figures/qoe_cdf.png")
     parser.add_argument("--stats-json", default=None, help="可选：输出各算法统计 JSON")
     parser.add_argument("--skip-first-chunk", action="store_true", default=True)
@@ -431,85 +547,140 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-better-arrow", action="store_true")
     args = parser.parse_args(argv)
 
-    algo_dirs: dict[str, str] = {}
-    if args.preset:
-        algo_dirs.update(
-            build_preset_paths(
-                args.preset,
-                trace=args.trace,
-                video=args.video,
-                trace_num=args.trace_num,
-                fixed_order=args.fixed_order,
-                seed=args.seed,
-                test_rounds=args.test_rounds,
-                ours_dir=args.ours_dir,
-            )
-        )
-    for spec in args.algo:
-        name, path = _parse_algo_spec(spec)
-        algo_dirs[name] = path
-
-    if args.ours_dir and "ours" not in algo_dirs:
-        algo_dirs["ours"] = args.ours_dir
-
-    if args.preset != "paper_seven":
-        algo_dirs = filter_algo_dirs(algo_dirs)
-
-    if not algo_dirs:
-        parser.error("请至少指定 --algo NAME=DIR 或 --preset")
-
     algo_qoe: dict[str, np.ndarray] = {}
     stats: dict[str, dict] = {}
     missing: list[str] = []
 
-    for name, log_root in algo_dirs.items():
-        abs_root = os.path.abspath(log_root)
-        if not os.path.isdir(abs_root):
-            missing.append(f"{name}: 目录不存在 {abs_root}")
-            continue
-        try:
-            if args.metric == "trace_mean":
+    if args.qoe_pt_dir:
+        from run.qoe_result_paths import normalize_trace_key, trace_output_slug
+        from run.qoe_tensordict_store import load_trace_algo_arrays_from_dir
+
+        pt_dir = os.path.abspath(args.qoe_pt_dir)
+        trace_slug = trace_output_slug(normalize_trace_key(args.trace))
+        arrays = load_trace_algo_arrays_from_dir(pt_dir, trace_slug)
+        if not arrays:
+            print(
+                f"错误: {pt_dir!r} 中无测试集 {trace_slug!r} 的 .pt "
+                f"（期望 {trace_slug}_*.pt）"
+            )
+            return 1
+        for algo, values in arrays.items():
+            if is_plot_excluded_algo(algo):
+                continue
+            algo_qoe[algo] = values
+            in_range = truncate_qoe(values, args.xmin, args.xmax)
+            stats[algo] = {
+                "source": "pt_tensordict",
+                "qoe_pt_dir": pt_dir,
+                "file": f"{trace_slug}_{algo}.pt",
+                "metric": "trace_mean",
+                "num_traces": int(values.size),
+                "num_traces_in_xlim": int(in_range.size),
+                "mean_qoe": float(values.mean()),
+                "median_qoe": float(np.median(values)),
+            }
+            print(
+                f"  {algo}: n={values.size} traces, mean={values.mean():.4f} "
+                f"({trace_slug}_{algo}.pt)"
+            )
+        algo_dirs = {}
+    else:
+        algo_dirs = {}
+    if not args.qoe_pt_dir:
+        if args.preset:
+            algo_dirs.update(
+                build_preset_paths(
+                    args.preset,
+                    trace=args.trace,
+                    video=args.video,
+                    trace_num=args.trace_num,
+                    fixed_order=args.fixed_order,
+                    seed=args.seed,
+                    test_rounds=args.test_rounds,
+                    ours_dir=args.ours_dir,
+                )
+            )
+        for spec in args.algo:
+            name, path = _parse_algo_spec(spec)
+            algo_dirs[name] = path
+
+        if args.ours_dir and "ours" not in algo_dirs:
+            algo_dirs["ours"] = args.ours_dir
+
+        if args.preset != "paper_seven":
+            algo_dirs = filter_algo_dirs(algo_dirs)
+
+        if not algo_dirs:
+            parser.error("请至少指定 --algo NAME=DIR、--preset 或 --qoe-pt-dir")
+    elif args.ours_dir and "ours" not in algo_qoe:
+        algo_dirs["ours"] = args.ours_dir
+
+    if not args.qoe_pt_dir:
+        for name, log_root in algo_dirs.items():
+            abs_root = os.path.abspath(log_root)
+            if not os.path.isdir(abs_root):
+                missing.append(f"{name}: 目录不存在 {abs_root}")
+                continue
+            try:
+                if args.metric == "trace_mean":
+                    values = collect_trace_mean_qoe(
+                        abs_root,
+                        skip_first_chunk=args.skip_first_chunk,
+                        skip_last_chunk=args.skip_last_chunk,
+                    )
+                else:
+                    values = collect_chunk_qoe(
+                        abs_root,
+                        skip_first=args.skip_first_chunk,
+                        skip_last=args.skip_last_chunk,
+                    )
+            except (FileNotFoundError, ValueError) as e:
+                missing.append(f"{name}: {e}")
+                continue
+            algo_qoe[name] = values
+            in_range = truncate_qoe(values, args.xmin, args.xmax)
+            stat_key = "num_traces" if args.metric == "trace_mean" else "num_chunks"
+            stats[name] = {
+                "log_root": abs_root,
+                "metric": args.metric,
+                stat_key: int(values.size),
+                f"{stat_key}_in_xlim": int(in_range.size),
+                f"{stat_key}_dropped": int(values.size - in_range.size),
+                "xlim": [args.xmin, args.xmax],
+                "mean_qoe": float(values.mean()),
+                "mean_qoe_in_xlim": float(in_range.mean()) if in_range.size else None,
+                "std_qoe": float(values.std()),
+                "min_qoe": float(values.min()),
+                "max_qoe": float(values.max()),
+                "median_qoe": float(np.median(values)),
+            }
+            print(
+                f"  {name}: n={values.size} traces, mean={values.mean():.4f}, "
+                f"median={np.median(values):.4f} (in [{args.xmin},{args.xmax}]: {in_range.size}), "
+                f"dir={abs_root}"
+                if args.metric == "trace_mean"
+                else
+                f"  {name}: n={values.size} chunks, mean={values.mean():.4f}, "
+                f"median={np.median(values):.4f} (in [{args.xmin},{args.xmax}]: {in_range.size}), "
+                f"dir={abs_root}"
+            )
+
+    # ours from log dir when .pt 中尚无 ours
+    if args.qoe_pt_dir and args.ours_dir and "ours" not in algo_qoe:
+        abs_root = os.path.abspath(args.ours_dir)
+        if os.path.isdir(abs_root):
+            try:
                 values = collect_trace_mean_qoe(
                     abs_root,
                     skip_first_chunk=args.skip_first_chunk,
                     skip_last_chunk=args.skip_last_chunk,
                 )
-            else:
-                values = collect_chunk_qoe(
-                    abs_root,
-                    skip_first=args.skip_first_chunk,
-                    skip_last=args.skip_last_chunk,
-                )
-        except (FileNotFoundError, ValueError) as e:
-            missing.append(f"{name}: {e}")
-            continue
-        algo_qoe[name] = values
-        in_range = truncate_qoe(values, args.xmin, args.xmax)
-        stat_key = "num_traces" if args.metric == "trace_mean" else "num_chunks"
-        stats[name] = {
-            "log_root": abs_root,
-            "metric": args.metric,
-            stat_key: int(values.size),
-            f"{stat_key}_in_xlim": int(in_range.size),
-            f"{stat_key}_dropped": int(values.size - in_range.size),
-            "xlim": [args.xmin, args.xmax],
-            "mean_qoe": float(values.mean()),
-            "mean_qoe_in_xlim": float(in_range.mean()) if in_range.size else None,
-            "std_qoe": float(values.std()),
-            "min_qoe": float(values.min()),
-            "max_qoe": float(values.max()),
-            "median_qoe": float(np.median(values)),
-        }
-        print(
-            f"  {name}: n={values.size} traces, mean={values.mean():.4f}, "
-            f"median={np.median(values):.4f} (in [{args.xmin},{args.xmax}]: {in_range.size}), "
-            f"dir={abs_root}"
-            if args.metric == "trace_mean"
-            else
-            f"  {name}: n={values.size} chunks, mean={values.mean():.4f}, "
-            f"median={np.median(values):.4f} (in [{args.xmin},{args.xmax}]: {in_range.size}), "
-            f"dir={abs_root}"
-        )
+                algo_qoe["ours"] = values
+                print(f"  ours: n={values.size} traces (dir={abs_root})")
+            except (FileNotFoundError, ValueError) as e:
+                missing.append(f"ours: {e}")
+        else:
+            missing.append(f"ours: 目录不存在 {abs_root}")
 
     if missing:
         print("\n警告：以下算法未纳入绘图：")
@@ -520,7 +691,8 @@ def main(argv: list[str] | None = None) -> int:
         print("错误：没有可用的 QoE 数据，请先运行 baseline 测试或检查 --algo 路径。")
         return 1
 
-    algo_qoe = order_algo_dict(algo_qoe)
+    algo_qoe = order_algo_dict(filter_plot_algos(algo_qoe))
+    stats = filter_plot_algos(stats)
 
     ylabel = (
         "CDF (Perc. of sessions)"

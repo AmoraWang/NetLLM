@@ -23,7 +23,7 @@
       --input-dir data/traces/train/eval_trajectories \\
       --output artifacts/exp_pools/eval_trajectories_pensieve_6x6.pkl
 
-  # Merina (11,6) 直出，供 ABRLLM v3
+  # Merina (11,6) 直出（legacy；v3 训练请用 pensieve 6×6）
   python run/convert_eval_trajectories_to_exp_pool.py \\
       --state-format merina \\
       --output artifacts/exp_pools/eval_trajectories_merina_11x6.pkl \\
@@ -495,13 +495,13 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         choices=(STATE_FORMAT_MERINA, STATE_FORMAT_PENSIEVE),
         default=STATE_FORMAT_PENSIEVE,
-        help="pensieve=(6,6) NetLLM 行序（默认）；merina=(11,6) 直出供 v3",
+        help="pensieve=(6,6) NetLLM 行序（默认，v2/v3 训练）；merina=(11,6) legacy 直出",
     )
     parser.add_argument(
         "--state-cols",
         type=int,
         default=DEFAULT_STATE_COLS,
-        help="输出状态历史长度（默认 6；与 S_LEN / ABRLLM_V3_S_LEN 一致）",
+        help="输出状态历史长度（默认 6；与 S_LEN 一致）",
     )
     parser.add_argument(
         "--history-slice",

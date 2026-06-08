@@ -1,6 +1,0 @@
-total_queries	485
-reference_traces	2434
-matched	86
-matched_content_hash	1
-matched_filename+content	85
-not_found	399

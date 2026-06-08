@@ -3,16 +3,22 @@
 绘制各 ABR 方法的 QoE 及其分量分组柱状图（风格参考论文 QoE 分解图）。
 
 四组指标（x 轴分组标签含 ↑/↓）：
-  - QoE ↑：平均每块 reward（去首块，与 CDF 一致）
-  - Bitrate ↑：平均码率（Mbps）
-  - Rebuffering ↓：平均重缓冲惩罚项 REBUF_PENALTY * rebuf（秒）
-  - Smoothness ↓：平均平滑度惩罚项 SMOOTH_PENALTY * |Δbitrate|（Mbps 差）
+  - QoE ↑：每条 trace 去首块后的 chunk 均值，再对 trace 求平均
+  - Bitrate ↑：平均码率（Mbps），对应 .pt 中 quality
+  - Rebuffering ↓：平均重缓冲惩罚项 REBUF_PENALTY * rebuf
+  - Smoothness ↓：平均平滑度惩罚项 SMOOTH_PENALTY * |Δbitrate|
+
+数据来源：
+  - ``--qoe-pt-dir``：``collect_qoe_cdf_columns.py`` 输出的 ``{trace}_{algo}.pt``
+  - 默认（无 ``--qoe-pt-dir``）：递归扫描测试结果日志目录
 
 纵轴：Average value
 
 示例：
   cd adaptive_bitrate_streaming
   bash bash/run_plot_components_bar.sh
+  python run/plot_qoe_components_bar.py \\
+    --qoe-pt-dir artifacts/qoe_cdf_columns/video1 --trace fcc-test --video video1
 """
 from __future__ import annotations
 
@@ -34,6 +40,8 @@ from run.plot_algo_defaults import (
     DEFAULT_PLOT_ALGOS,
     algo_display_name,
     filter_algo_dirs,
+    filter_plot_algos,
+    is_plot_excluded_algo,
 )
 from run.plot_qoe_cdf import (
     LOG_NAME_HINTS,
@@ -169,6 +177,30 @@ def collect_algo_component_means(
     }
 
 
+def collect_algo_component_means_from_pt(path: str) -> dict[str, float]:
+    """从 ``{trace}_{algo}.pt`` 读取四组柱状图指标（trace 维均值）。"""
+    from run.qoe_tensordict_store import load_component_means_from_pt
+
+    means = load_component_means_from_pt(path)
+    return {
+        "qoe": means["qoe"],
+        "bitrate_mbps": means["bitrate_mbps"],
+        "rebuf_penalty": means["rebuf_penalty"],
+        "smooth_penalty": means["smooth_penalty"],
+        "num_traces": means["num_traces"],
+    }
+
+
+def _print_algo_means(name: str, means: dict[str, float]) -> None:
+    count_key = "num_traces" if "num_traces" in means else "num_chunks"
+    count = means[count_key]
+    print(
+        f"  {name}: {count_key}={count}, "
+        f"QoE={means['qoe']:.4f}, bitrate={means['bitrate_mbps']:.4f} Mbps, "
+        f"rebuf_pen={means['rebuf_penalty']:.4f}, smooth_pen={means['smooth_penalty']:.4f}"
+    )
+
+
 def plot_qoe_components_bar(
     algo_metrics: dict[str, dict[str, float]],
     *,
@@ -264,6 +296,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--test-rounds", type=int, default=1)
     parser.add_argument("--ours-dir", default=None)
     parser.add_argument(
+        "--qoe-pt-dir",
+        "--qoe-tensordict",
+        dest="qoe_pt_dir",
+        default=None,
+        help="collect_qoe_cdf_columns.py 输出目录（读取 {trace}_{algo}.pt）",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         default="artifacts/figures/qoe_components_bar.png",
@@ -276,63 +315,122 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args(argv)
 
-    algo_dirs: dict[str, str] = {}
-    if args.preset:
-        algo_dirs.update(
-            build_preset_paths(
-                args.preset,
-                trace=args.trace,
-                video=args.video,
-                trace_num=args.trace_num,
-                fixed_order=args.fixed_order,
-                seed=args.seed,
-                test_rounds=args.test_rounds,
-                ours_dir=args.ours_dir,
-            )
-        )
-    for spec in args.algo:
-        name, path = _parse_algo_spec(spec)
-        algo_dirs[name] = path
-
-    if args.ours_dir and "ours" not in algo_dirs:
-        algo_dirs["ours"] = args.ours_dir
-
-    if args.preset != "paper_seven":
-        algo_dirs = filter_algo_dirs(algo_dirs)
-
     bar_order = tuple(s.strip() for s in args.bar_algos.split(",") if s.strip())
 
     algo_metrics: dict[str, dict[str, float]] = {}
     stats: dict[str, dict] = {}
     missing: list[str] = []
 
-    for name, log_root in algo_dirs.items():
-        if name not in bar_order and not args.algo:
-            continue
-        abs_root = os.path.abspath(log_root)
-        if not os.path.isdir(abs_root):
-            missing.append(f"{name}: 目录不存在 {abs_root}")
-            continue
-        try:
-            means = collect_algo_component_means(
-                abs_root,
-                skip_first=args.skip_first_chunk,
-                skip_last=args.skip_last_chunk,
+    if args.qoe_pt_dir:
+        from run.qoe_result_paths import (
+            OURS_PT_ALGO,
+            normalize_trace_key,
+            plot_key_to_pt_algo,
+            trace_output_slug,
+        )
+        from run.qoe_tensordict_store import make_result_pt_path
+
+        pt_dir = os.path.abspath(args.qoe_pt_dir)
+        trace_slug = trace_output_slug(normalize_trace_key(args.trace))
+        plot_targets = bar_order or tuple(DEFAULT_BAR_ALGOS)
+
+        for plot_key in plot_targets:
+            if is_plot_excluded_algo(plot_key):
+                continue
+            pt_algo = plot_key_to_pt_algo(plot_key)
+            if pt_algo is None:
+                missing.append(f"{plot_key}: 无对应 .pt 算法名")
+                continue
+            pt_path = make_result_pt_path(pt_dir, trace_slug, pt_algo)
+            if not os.path.isfile(pt_path):
+                if plot_key.lower() == OURS_PT_ALGO and args.ours_dir:
+                    continue
+                missing.append(f"{plot_key}: 缺少 {pt_path}")
+                continue
+            try:
+                means = collect_algo_component_means_from_pt(pt_path)
+                store_key = "ours" if plot_key.lower() == OURS_PT_ALGO else plot_key
+                algo_metrics[store_key] = means
+                stats[store_key] = {
+                    "source": "pt_tensordict",
+                    "file": pt_path,
+                    "trace_slug": trace_slug,
+                    "pt_algo": pt_algo,
+                    **means,
+                }
+                _print_algo_means(store_key, means)
+            except (FileNotFoundError, ValueError, TypeError, KeyError) as e:
+                missing.append(f"{plot_key}: {e}")
+
+        if "ours" not in algo_metrics and args.ours_dir:
+            abs_root = os.path.abspath(args.ours_dir)
+            if os.path.isdir(abs_root):
+                try:
+                    means = collect_algo_component_means(
+                        abs_root,
+                        skip_first=args.skip_first_chunk,
+                        skip_last=args.skip_last_chunk,
+                    )
+                    algo_metrics["ours"] = means
+                    stats["ours"] = {"source": "log_dir", "log_root": abs_root, **means}
+                    _print_algo_means("ours", means)
+                except (FileNotFoundError, ValueError) as e:
+                    missing.append(f"ours: {e}")
+            else:
+                missing.append(f"ours: 目录不存在 {abs_root}")
+    else:
+        algo_dirs: dict[str, str] = {}
+        if args.preset:
+            algo_dirs.update(
+                build_preset_paths(
+                    args.preset,
+                    trace=args.trace,
+                    video=args.video,
+                    trace_num=args.trace_num,
+                    fixed_order=args.fixed_order,
+                    seed=args.seed,
+                    test_rounds=args.test_rounds,
+                    ours_dir=args.ours_dir,
+                )
             )
-            algo_metrics[name] = means
-            stats[name] = {"log_root": abs_root, **means}
-            print(
-                f"  {name}: chunks={means['num_chunks']}, "
-                f"QoE={means['qoe']:.4f}, bitrate={means['bitrate_mbps']:.4f} Mbps, "
-                f"rebuf_pen={means['rebuf_penalty']:.4f}, smooth_pen={means['smooth_penalty']:.4f}"
-            )
-        except (FileNotFoundError, ValueError) as e:
-            missing.append(f"{name}: {e}")
+        for spec in args.algo:
+            name, path = _parse_algo_spec(spec)
+            algo_dirs[name] = path
+
+        if args.ours_dir and "ours" not in algo_dirs:
+            algo_dirs["ours"] = args.ours_dir
+
+        if args.preset != "paper_seven":
+            algo_dirs = filter_algo_dirs(algo_dirs)
+
+        for name, log_root in algo_dirs.items():
+            if is_plot_excluded_algo(name):
+                continue
+            if name not in bar_order and not args.algo:
+                continue
+            abs_root = os.path.abspath(log_root)
+            if not os.path.isdir(abs_root):
+                missing.append(f"{name}: 目录不存在 {abs_root}")
+                continue
+            try:
+                means = collect_algo_component_means(
+                    abs_root,
+                    skip_first=args.skip_first_chunk,
+                    skip_last=args.skip_last_chunk,
+                )
+                algo_metrics[name] = means
+                stats[name] = {"source": "log_dir", "log_root": abs_root, **means}
+                _print_algo_means(name, means)
+            except (FileNotFoundError, ValueError) as e:
+                missing.append(f"{name}: {e}")
 
     if missing:
         print("\n警告：")
         for m in missing:
             print(f"  - {m}")
+
+    algo_metrics = filter_plot_algos(algo_metrics)
+    stats = filter_plot_algos(stats)
 
     plot_order = tuple(a for a in bar_order if a in algo_metrics)
     if not plot_order:

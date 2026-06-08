@@ -10,11 +10,9 @@ from baseline_special.env import Environment
 from baseline_special.utils.constants import (
     REBUF_PENALTY, SMOOTH_PENALTY, DEFAULT_QUALITY, S_INFO, S_LEN, BITRATE_LEVELS, BUFFER_NORM_FACTOR,
     M_IN_K, SMOOTH_PENALTY, VIDEO_BIT_RATE, CHUNK_TIL_VIDEO_END_CAP, MAX_VIDEO_BIT_RATE, DEFAULT_QUALITY,
-    ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN,
 )
 from baseline_special.utils.mahimahi_start import apply_test_round_mahimahi_ptrs
 from plm_special.utils.utils import calc_mean_reward, clear_dir, set_random_seed
-from plm_special.utils.merina_abr_state import merina_abr_apply_state_step_torch
 
 
 def _write_results_round(results_dir, results_log, all_file_names):
@@ -56,9 +54,7 @@ def _run_single_test_round(args, model, env_kw, numpy_random_seed, max_ep_num, t
         time_stamp = 0
         last_bit_rate = DEFAULT_QUALITY
         bit_rate = DEFAULT_QUALITY
-        use_v3 = getattr(args, 'abr_llm_version', 'v2') == 'v3'
-        si, sl = (ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN) if use_v3 else (S_INFO, S_LEN)
-        state = torch.zeros((1, 1, si, sl), dtype=torch.float32, device=args.device)
+        state = torch.zeros((1, 1, S_INFO, S_LEN), dtype=torch.float32, device=args.device)
         timestep = 0
         target_return_clone = copy.deepcopy(target_return)
         trace_idx = env.trace_idx
@@ -82,19 +78,15 @@ def _run_single_test_round(args, model, env_kw, numpy_random_seed, max_ep_num, t
             results_log[trace_idx].append([time_stamp / M_IN_K, VIDEO_BIT_RATE[bit_rate], buffer_size,
                                            rebuf, video_chunk_size, delay, smoothness, reward])
 
-            if use_v3:
-                merina_abr_apply_state_step_torch(
-                    state, bit_rate, delay, buffer_size, video_chunk_size,
-                    next_video_chunk_sizes, video_chunk_remain,
-                )
-            else:
-                state = torch.roll(state, -1, dims=-1)
-                state[..., 0, -1] = VIDEO_BIT_RATE[bit_rate] / MAX_VIDEO_BIT_RATE
-                state[..., 1, -1] = buffer_size / BUFFER_NORM_FACTOR
-                state[..., 2, -1] = video_chunk_size / delay / M_IN_K
-                state[..., 3, -1] = delay / M_IN_K / BUFFER_NORM_FACTOR
-                state[..., 4, :BITRATE_LEVELS] = torch.as_tensor(next_video_chunk_sizes, device=args.device, dtype=torch.float32) / M_IN_K / M_IN_K
-                state[..., 5, -1] = min(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / CHUNK_TIL_VIDEO_END_CAP
+            state = torch.roll(state, -1, dims=-1)
+            state[..., 0, -1] = VIDEO_BIT_RATE[bit_rate] / MAX_VIDEO_BIT_RATE
+            state[..., 1, -1] = buffer_size / BUFFER_NORM_FACTOR
+            state[..., 2, -1] = video_chunk_size / delay / M_IN_K
+            state[..., 3, -1] = delay / M_IN_K / BUFFER_NORM_FACTOR
+            state[..., 4, :BITRATE_LEVELS] = torch.as_tensor(
+                next_video_chunk_sizes, device=args.device, dtype=torch.float32
+            ) / M_IN_K / M_IN_K
+            state[..., 5, -1] = min(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / CHUNK_TIL_VIDEO_END_CAP
 
             if timestep > 0:
                 reward = process_reward_fn(reward)
@@ -246,14 +238,14 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
             sf.write(f'std_qoe_across_rounds\t{std_qoe_across_rounds:.6f}\n')
             sf.write(f'mean_qoe_per_round\t{round_mean_qoes}\n')
 
-    print(f'\nDecision Time Statistics:')
-    print(f'  Total decisions: {len(all_decision_times)}')
-    print(f'  Total decision time: {total_decision_time:.4f} seconds')
-    print(f'  Average decision time: {avg_decision_time:.6f} seconds ({avg_decision_time * 1000:.3f} ms)')
-    if len(all_decision_times) > 0:
-        print(f'  Min decision time: {min(all_decision_times) * 1000:.3f} ms')
-        print(f'  Max decision time: {max(all_decision_times) * 1000:.3f} ms')
-    if multi:
-        print(f'\nMulti-round test: mean_qoe (avg over rounds) = {mean_qoe:.6f}, std = {std_qoe_across_rounds:.6f}')
+    # print(f'\nDecision Time Statistics:')
+    # print(f'  Total decisions: {len(all_decision_times)}')
+    # print(f'  Total decision time: {total_decision_time:.4f} seconds')
+    # print(f'  Average decision time: {avg_decision_time:.6f} seconds ({avg_decision_time * 1000:.3f} ms)')
+    # if len(all_decision_times) > 0:
+    #     print(f'  Min decision time: {min(all_decision_times) * 1000:.3f} ms')
+    #     print(f'  Max decision time: {max(all_decision_times) * 1000:.3f} ms')
+    # if multi:
+    #     print(f'\nMulti-round test: mean_qoe (avg over rounds) = {mean_qoe:.6f}, std = {std_qoe_across_rounds:.6f}')
 
     return test_log

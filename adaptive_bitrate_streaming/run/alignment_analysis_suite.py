@@ -30,9 +30,7 @@ import torch.nn as nn
 
 from config import cfg
 from plm_special.data.dataset import ExperienceDataset
-from plm_special.models.low_rank import peft_model
 from plm_special.utils.utils import set_random_seed
-from run.run_abr import load_model
 
 try:
     import matplotlib.pyplot as plt
@@ -67,30 +65,16 @@ def _json_safe(obj):
 
 
 def _load_args_namespace(cli_args):
-    if cli_args.sample_step is None:
-        cli_args.sample_step = cli_args.w
-    if cli_args.device is None:
-        cli_args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    cli_args.state_embedding_dim = cli_args.state_feature_dim
-    cli_args.abr_llm_version = "v2"
-    cli_args.model_path = os.path.join(cfg.plm_dir, cli_args.plm_type, cli_args.plm_size)
-    cli_args.llm_dim = cfg.plm_embed_sizes[cli_args.plm_type][cli_args.plm_size]
-    cli_args.max_length = cli_args.w
+    from run.abr_viz_common import patch_viz_args
+
+    patch_viz_args(cli_args)
     return cli_args
 
 
 def _build_model(cli_args, load_weights=True):
-    from ABRLLM_v2 import ABRLLM
+    from run.abr_viz_common import build_abrllm
 
-    model = ABRLLM(cli_args)
-    model.device = torch.device(cli_args.device)
-    model = model.to(cli_args.device)
-    if cli_args.rank > 0:
-        model.plm = peft_model(model.plm, cli_args.plm_type, rank=cli_args.rank)
-    if load_weights:
-        model = load_model(cli_args, model, cli_args.model_dir)
-    model.eval()
-    return model
+    return build_abrllm(cli_args, load_weights=load_weights)
 
 
 def _batch_from_dataset(dataset, sample_index: int):
@@ -532,7 +516,15 @@ def main():
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--scale", type=int, default=1000)
     parser.add_argument("--sample-step", type=int, default=None)
-    parser.add_argument("--state-feature-dim", type=int, default=512)
+    parser.add_argument(
+        "--abr-llm-version",
+        choices=("v2", "v3"),
+        default="v2",
+        help="须与 checkpoint 一致",
+    )
+    parser.add_argument("--contrast-dim", type=int, default=256)
+    parser.add_argument("--align-lambda", type=float, default=0.1)
+    parser.add_argument("--state-feature-dim", type=int, default=256)
     parser.add_argument("--state-attn-hidden-dim", type=int, default=2048)
     parser.add_argument("--state-use-self-attention", action="store_true", default=True)
     parser.add_argument("--fusion-method", default="weighted_sum")

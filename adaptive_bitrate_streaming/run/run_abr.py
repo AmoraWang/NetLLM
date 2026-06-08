@@ -19,7 +19,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from config import cfg
 from baseline_special.utils.utils import load_traces
-from baseline_special.utils.constants import ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN
+from baseline_special.utils.constants import S_INFO, S_LEN
 from plm_special.trainer import Trainer
 from plm_special.evaluate import evaluate_on_env
 from plm_special.test import test_on_env
@@ -202,18 +202,28 @@ def run(args):
 
         if len(exp_pool.states):
             st0 = np.asarray(exp_pool.states[0])
-            if st0.shape != (ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN):
+            if st0.shape != (S_INFO, S_LEN):
                 raise ValueError(
-                    f"经验池状态形状 {st0.shape} 与 ABRLLM v3 期望 {(ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN)} 不符；"
-                    "请使用 generate_exp_pool.py --abr-llm-version v3 重新生成。"
+                    f"经验池状态形状 {st0.shape} 与 NetLLM 期望 {(S_INFO, S_LEN)} 不符；"
+                    "请使用 generate_exp_pool.py 生成 (6,6) 经验池。"
+                )
+    elif getattr(args, 'abr_llm_version', 'v2') == 'v4':
+        from ABRLLM_v4 import ABRLLM as ABRLLMCls
+
+        if len(exp_pool.states):
+            st0 = np.asarray(exp_pool.states[0])
+            if st0.shape != (S_INFO, S_LEN):
+                raise ValueError(
+                    f"经验池状态形状 {st0.shape} 与 NetLLM 期望 {(S_INFO, S_LEN)} 不符；"
+                    "请使用 generate_exp_pool.py 生成 (6,6) 经验池。"
                 )
     else:
         from ABRLLM_v2 import ABRLLM as ABRLLMCls
 
     exp_dataset = ExperienceDataset(exp_pool, gamma=args.gamma, scale=args.scale, max_length=args.w, sample_step=args.sample_step)
     exp_dataset_info = Munch(exp_dataset.exp_dataset_info)
-    print('Experience dataset info:')
-    pprint(exp_dataset_info)
+    # print('Experience dataset info:')
+    # pprint(exp_dataset_info)
     
     # 4. create ABRLLM model
     # ABRLLM will load PLM and create state encoder internally
@@ -252,6 +262,17 @@ def run(args):
         f'_sattn_{args.state_use_self_attention}_sahd_{args.state_attn_hidden_dim}_fusion_{args.fusion_method}'
         f'_loss_{args.loss_type}'
         + (f'_kdalpha_{args.kd_alpha}_kdtemp_{args.kd_temperature}' if args.loss_type == 'ce_kl' else '')
+        + (
+            f'_align_{args.align_lambda}_temp_{args.align_temperature}_cdim_{args.contrast_dim}'
+            if getattr(args, 'abr_llm_version', 'v2') == 'v3' and args.align_lambda > 0
+            else ''
+        )
+        + (
+            f'_bwvae_ld{args.bw_vae_latent_dim}_beta_{args.bw_vae_beta}_klw_{args.bw_vae_kl_weight}'
+            f'_bwf_{args.bw_vae_fusion}'
+            if getattr(args, 'abr_llm_version', 'v2') == 'v4'
+            else ''
+        )
         + f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}'
     )
     results_dir = os.path.join(
@@ -314,9 +335,9 @@ if __name__ == '__main__':
     parser.add_argument(
         '--abr-llm-version',
         type=str,
-        choices=('v2', 'v3'),
+        choices=('v2', 'v3', 'v4'),
         default='v2',
-        help='v2: Pensieve (6,6) 状态与 ABRLLM_v2；v3: Merina 行序 (11,6) 与 ABRLLM_v3（需匹配经验池与仿真状态）',
+        help='v2: ABRLLM_v2；v3: 语义模板+对比对齐；v4: v2 + 带宽 β-VAE latent',
     )
     parser.add_argument('--state-feature-dim', type=int, help='feature dim of the state encoder', default=256)
     parser.add_argument('--state-embedding-dim', type=int, help='embedding dim for state encoder (defaults to state-feature-dim)', default=None)
@@ -366,6 +387,47 @@ if __name__ == '__main__':
         action='store_true',
         help='teacher_logits in the pool are probabilities (sum to 1), not raw logits',
     )
+    parser.add_argument(
+        '--align-lambda',
+        type=float,
+        default=0.0,
+        help='v3 跨模态对比损失权重；>0 时总损失 = L_train + align_lambda * L_align',
+    )
+    parser.add_argument(
+        '--align-temperature',
+        type=float,
+        default=0.07,
+        help='v3 InfoNCE 温度（传入 ABRLLM_v3）',
+    )
+    parser.add_argument(
+        '--contrast-dim',
+        type=int,
+        default=256,
+        help='v3 对比空间输出维度；0 表示不投影，直接在 llm_dim 上对比',
+    )
+    parser.add_argument(
+        '--contrast-hidden-dim',
+        type=int,
+        default=0,
+        help='v3 对比 MLP 隐藏维（Linear-LeakyReLU-Linear）；0 表示 min(llm_dim, max(2*contrast_dim, 256))',
+    )
+
+    # 带宽 β-VAE（仅 ABRLLM v4 使用；v4 内固定启用）
+    parser.add_argument('--bw-vae-latent-dim', type=int, default=16, help='v4 带宽 VAE latent 维度')
+    parser.add_argument('--bw-vae-beta', type=float, default=0.4, help='v4 带宽 VAE β-KLD 系数')
+    parser.add_argument(
+        '--bw-vae-kl-weight',
+        type=float,
+        default=0.01,
+        help='v4 训练总 loss 中 bandwidth VAE KL 项权重',
+    )
+    parser.add_argument(
+        '--bw-vae-fusion',
+        type=str,
+        choices=('residual', 'concat'),
+        default='residual',
+        help='v4 带宽 latent 与 state_emb 融合方式：residual=残差相加，concat=拼接后 Linear 融合',
+    )
     
     # other settings
     parser.add_argument('--adapt', action="store_true", help='adapt model')
@@ -410,8 +472,8 @@ if __name__ == '__main__':
     # Set max_length for ABRLLM (used for history deque)
     args.max_length = args.w
     
-    print('Arguments:')
-    pprint(args)
+    #print('Arguments:')
+    #pprint(args)
     
     run(args)
 

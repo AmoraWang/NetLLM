@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 使用 Merina 预训练策略（Actor + BetaVAE）在 NetLLM 带宽 trace 与 video_size_* 上采集轨迹，
-状态布局与 ``generate_exp_pool.py --abr-llm-version v3`` 一致（numpy float32, shape (11, 6)），
-供 ``run_abr.py --abr-llm-version v3`` 训练 ABRLLM_v3。
+Legacy：输出 Merina 行序 (11, 6) 经验池。当前 ABRLLM_v3 训练请用
+``generate_exp_pool.py`` 的 NetLLM (6, 6) 与 ``run_abr.py --abr-llm-version v3``。
 
 默认带宽：``adaptive_bitrate_streaming/data/traces/train/fcc_hsdpa_cooked_traces`` 下全部轨迹
 （``load_traces``）；可用 ``--trace-dir`` 改目录；若指定 ``--traces`` 则改为 ``config.cfg.trace_dirs`` 多键合并。
@@ -38,6 +38,9 @@ _DEFAULT_VAE = os.path.join(_MERINA_ROOT, "models", "pretrain_vae_lin.model")
 
 MERINA_S_INFO = 11
 MERINA_S_LEN = 2
+# 写入经验池的 Merina 行序矩阵（与 NetLLM 6×6 不同）
+MERINA_POOL_S_INFO = 11
+MERINA_POOL_S_LEN = 6
 MERINA_C_LEN = 8
 MERINA_VIDEO_BIT_RATE = [300, 750, 1200, 1850, 2850, 4300]
 MERINA_REBUF_LIN = 4.3
@@ -196,9 +199,9 @@ def collect_one_video(
     _, _, c_len, _, bitrate_versions, _, _ = test_env.get_env_info()
     a_dim = len(bitrate_versions)
 
-    from baseline_special.utils.constants import ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN, BUFFER_NORM_FACTOR, BITRATE_LEVELS
+    from baseline_special.utils.constants import BUFFER_NORM_FACTOR, BITRATE_LEVELS
 
-    state_pool = np.zeros((ABRLLM_V3_S_INFO, ABRLLM_V3_S_LEN), dtype=np.float32)
+    state_pool = np.zeros((MERINA_POOL_S_INFO, MERINA_POOL_S_LEN), dtype=np.float32)
     state_policy = np.zeros((MERINA_S_INFO, MERINA_S_LEN), dtype=np.float32)
     vae_in_channels = 2
     ob = np.zeros((vae_in_channels, c_len), dtype=np.float32)
