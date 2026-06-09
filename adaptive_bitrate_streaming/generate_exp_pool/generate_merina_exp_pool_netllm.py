@@ -9,12 +9,19 @@ numpy ``float32``、shape **(6, 6)**（Pensieve / NetLLM 行序），供 ``run_a
 **奖励**与 ``generate_exp_pool.collect_experience`` 中 Pensieve 分支一致（``VIDEO_BIT_RATE``、
 ``REBUF_PENALTY``、``SMOOTH_PENALTY``），便于与 GENET/MPC 经验池混训或对齐尺度。
 
+默认写入 ``teacher_logits``（Merina Actor 的 6 维 **Softmax 概率**），供 ``run_abr.py --loss-type ce_kl``
+使用；训练时请加 ``--teacher-is-prob``。若加 ``--teacher-as-log-prob`` 则存 ``log(prob)`` 作伪 logits。
+
 带宽合并、Merina 环境随机起点、CUDA 回退与 ``generate_merina_exp_pool_v3.py`` 对齐；
 参数风格可共用 ``--traces`` / ``--videos`` / ``--cpu`` 等。
 
 示例：
   cd adaptive_bitrate_streaming
-  python generate_exp_pool/generate_merina_exp_pool_netllm.py --output artifacts/exp_pools/merina_netllm_6x6.pkl --cpu
+  python generate_exp_pool/generate_merina_exp_pool_netllm.py \\
+      --traces fcc-train --videos video1 \\
+      --output artifacts/exp_pools/merina_fcc-train_video1_logits.pkl --cpu
+  python run/run_abr.py --adapt --loss-type ce_kl --teacher-is-prob \\
+      --exp-pool-path artifacts/exp_pools/merina_fcc-train_video1_logits.pkl ...
 """
 from __future__ import annotations
 
@@ -80,6 +87,23 @@ def _apply_state_pool_step_pensieve(
     state_pool[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
 
 
+def _actor_prob_to_teacher(prob, *, as_log_prob: bool) -> np.ndarray:
+    """Merina Actor 输出 Softmax 概率 → 写入经验池的 teacher 向量 (6,)。"""
+    import torch
+
+    p = prob.detach().float().reshape(-1)
+    if p.numel() != 6:
+        raise ValueError(f"期望 6 档码率概率，得到 shape {tuple(prob.shape)}")
+    if torch.isnan(p).any() or torch.isinf(p).any():
+        p = torch.full_like(p, 1.0 / 6.0)
+    p = p / p.sum().clamp(min=1e-8)
+    if as_log_prob:
+        arr = torch.log(p.clamp(min=1e-6)).cpu().numpy().astype(np.float32)
+    else:
+        arr = p.cpu().numpy().astype(np.float32)
+    return arr
+
+
 def collect_one_video(
     all_cooked_time: list,
     all_cooked_bw: list,
@@ -90,8 +114,8 @@ def collect_one_video(
     device_torch: str,
     args_ns: argparse.Namespace,
     rebuff_p_merina: float,
-) -> tuple[list, list, list, list]:
-    """Merina 策略 + NetLLM (6,6) 状态 + NetLLM 式标量 reward。"""
+) -> tuple[list, list, list, list, list]:
+    """Merina 策略 + NetLLM (6,6) 状态 + NetLLM 式标量 reward + Merina teacher 分布。"""
     sys.path.insert(0, _MERINA_ROOT)
     import envs.fixed_env_log as merina_env_mod  # noqa: WPS433
 
@@ -166,15 +190,20 @@ def collect_one_video(
     total_a: list[int] = []
     total_r: list[float] = []
     total_d: list[bool] = []
+    total_teacher: list[np.ndarray] = []
 
     ep_s: list[np.ndarray] = []
     ep_a: list[int] = []
     ep_r: list[float] = []
     ep_d: list[bool] = []
+    ep_teacher: list[np.ndarray] = []
 
     import torch
 
+    pending_teacher: np.ndarray | None = None
+
     for _video_idx in range(len(all_file_names)):
+        pending_teacher = None
         while True:
             delay, sleep_time, buffer_size, rebuf, video_chunk_size, next_video_chunk_sizes, end_of_video, video_chunk_remain, _ = test_env.get_video_chunk(int(bit_rate))
 
@@ -186,10 +215,12 @@ def collect_one_video(
 
             last_bit_rate = int(bit_rate)
 
-            ep_s.append(np.copy(state_pool))
-            ep_a.append(int(bit_rate))
-            ep_r.append(reward)
-            ep_d.append(bool(end_of_video))
+            if pending_teacher is not None:
+                ep_s.append(np.copy(state_pool))
+                ep_a.append(int(bit_rate))
+                ep_r.append(reward)
+                ep_d.append(bool(end_of_video))
+                ep_teacher.append(pending_teacher.copy())
 
             _apply_state_pool_step_pensieve(
                 state_pool,
@@ -221,15 +252,19 @@ def collect_one_video(
             with torch.no_grad():
                 latent = model_vae.get_latent(ob_t).detach()
                 prob = model_actor.forward(state_t, latent).detach()
-                if torch.isnan(prob).any() or torch.isinf(prob).any():
-                    prob = torch.full_like(prob, 1.0 / float(prob.shape[-1]))
-                prob = prob / prob.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                pending_teacher = _actor_prob_to_teacher(
+                    prob.squeeze(0),
+                    as_log_prob=bool(args_ns.teacher_as_log_prob),
+                )
 
+            prob_t = torch.from_numpy(pending_teacher).to(device_torch).float().reshape(1, -1)
+            if args_ns.teacher_as_log_prob:
+                prob_t = torch.softmax(prob_t, dim=-1)
             if args_ns.stocha:
-                act = prob.multinomial(num_samples=1).detach()
+                act = prob_t.multinomial(num_samples=1).detach()
                 bit_rate = int(act.squeeze().cpu().numpy())
             else:
-                bit_rate = int(torch.argmax(prob, dim=-1).squeeze().cpu().numpy())
+                bit_rate = int(torch.argmax(prob_t, dim=-1).squeeze().cpu().numpy())
             bit_rate = max(0, min(BITRATE_LEVELS - 1, bit_rate))
 
             if end_of_video:
@@ -238,22 +273,25 @@ def collect_one_video(
                     total_a.extend(ep_a[1:])
                     total_r.extend(ep_r[1:])
                     total_d.extend(ep_d[1:])
+                    total_teacher.extend(ep_teacher[1:])
                 ep_s.clear()
                 ep_a.clear()
                 ep_r.clear()
                 ep_d.clear()
+                ep_teacher.clear()
 
                 state_pool.fill(0.0)
                 state_policy.fill(0.0)
                 ob.fill(0.0)
                 bit_rate = MERINA_DEFAULT_QUALITY
                 last_bit_rate = MERINA_DEFAULT_QUALITY
+                pending_teacher = None
 
                 if _video_idx + 1 >= len(all_file_names):
-                    return total_s, total_a, total_r, total_d
+                    return total_s, total_a, total_r, total_d, total_teacher
                 break
 
-    return total_s, total_a, total_r, total_d
+    return total_s, total_a, total_r, total_d, total_teacher
 
 
 def main() -> int:
@@ -287,6 +325,11 @@ def main() -> int:
         help="仅影响 Merina 环境内部 rebuff_p（与 log 权重一致）；池内 reward 仍为 NetLLM 线性标量",
     )
     p.add_argument("--stocha", action="store_true")
+    p.add_argument(
+        "--teacher-as-log-prob",
+        action="store_true",
+        help="teacher_logits 存 log(prob)（训练时不加 --teacher-is-prob）；默认存概率",
+    )
     p.add_argument("--cuda-id", type=int, default=None)
     p.add_argument("--cpu", action="store_true")
     args_ns = p.parse_args()
@@ -356,7 +399,7 @@ def main() -> int:
     for vk in args_ns.videos:
         video_size_dir = cfg.video_size_dirs[vk]
         print(f"--- 采集 video={vk} ---")
-        ts, ta, tr, td = collect_one_video(
+        ts, ta, tr, td, tt = collect_one_video(
             all_t,
             all_b,
             all_n,
@@ -369,7 +412,13 @@ def main() -> int:
         )
         print(f"    transitions: {len(ts)}")
         for i in range(len(ts)):
-            pool.add(state=ts[i], action=ta[i], reward=tr[i], done=td[i])
+            pool.add(
+                state=ts[i],
+                action=ta[i],
+                reward=tr[i],
+                done=td[i],
+                teacher_logits=tt[i],
+            )
 
     out_path = os.path.abspath(args_ns.output)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -379,6 +428,13 @@ def main() -> int:
     if len(pool.states):
         s0 = np.asarray(pool.states[0])
         print(f"首条 state shape: {s0.shape} dtype={s0.dtype}")
+    if getattr(pool, "has_teacher_logits", False):
+        t0 = np.asarray(pool.teacher_logits[0], dtype=np.float32).reshape(-1)
+        print(f"teacher_logits: {len(pool.teacher_logits)} 条, 首条 shape={t0.shape}, sum={t0.sum():.4f}")
+        if args_ns.teacher_as_log_prob:
+            print("  训练: run_abr.py --loss-type ce_kl（勿加 --teacher-is-prob）")
+        else:
+            print("  训练: run_abr.py --loss-type ce_kl --teacher-is-prob")
     print(f"总 transition 数: {len(pool)}")
     print(f"已写入: {out_path}")
     return 0

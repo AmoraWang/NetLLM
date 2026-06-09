@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-BW_VAE_FUSION="${BW_VAE_FUSION:-concat}"
+BW_VAE_FUSION="${BW_VAE_FUSION:-residual}"
 BW_VAE_LATENT_DIM="${BW_VAE_LATENT_DIM:-16}"
 TRACE="${TRACE:-fcc-test}"
 VIDEO="${VIDEO:-video1}"
@@ -21,12 +21,13 @@ DEVICE="${DEVICE:-cuda:0}"
 SEED="${SEED:-666}"
 
 python run/run_abr.py \
+  --adapt \
   --test \
   --abr-llm-version v4 \
   --loss-type ce_kl \
   --kd-alpha 0.5 \
   --kd-temperature 2.0 \
-  --exp-pool-path artifacts/exp_pools/exp_pool.pkl \
+  --exp-pool-path artifacts/exp_pools/merina_merged_logits.pkl \
   --trace "${TRACE}" \
   --video "${VIDEO}" \
   --trace-num 100 \
@@ -48,7 +49,7 @@ python run/run_abr.py \
   --gamma 1. \
   --lr 5e-5 \
   --warmup-steps 300 \
-  --num-epochs 60 \
+  --num-epochs 70 \
   --eval-per-epoch 2 \
   --target-return-scale 1 \
   --save-checkpoint-per-epoch 50 \

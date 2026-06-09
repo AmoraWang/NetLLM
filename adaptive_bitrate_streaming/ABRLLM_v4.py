@@ -18,7 +18,6 @@ from munch import Munch
 from plm_special.data.dataset import ExperienceDataset
 from pprint import pprint
 from plm_special.models.low_rank import peft_model
-from mamba_ssm import Mamba
 from abr_bandwidth_vae import BandwidthVAE
 
 class ABRLLM(nn.Module):
@@ -489,41 +488,6 @@ class ABRLLM(nn.Module):
         else:
             # Append empty tensor if return_embedding is not provided (use float32 for consistency)
             self.returns_dq.append(torch.zeros((1, 0, self.llm_dim), dtype=torch.float32, device=self.device))
-
-    # def get_tokenizer_size(self):
-    #     return self.word_embeddings.shape
-    # def get_state_size(self):
-    #     a=torch.rand(1, 10, 6, 6)
-    #     features = self.state_encoder(a)
-    #     return features[0].shape, features[1].shape, features[2].shape, features[3].shape, features[4].shape, features[5].shape
-    # def get_timestep_size(self):
-    #     timestep = torch.randint(0, 100, (1, 10), dtype=torch.long, device=self.device)
-    #     timestep_embeddings = self.timestep_embedding(timestep)
-    #     return timestep_embeddings.shape
-    # def get_instruction_size(self):
-    #     instruction = (
-    #         f"<|start_prompt|>Data description: {self.data_description}"
-    #         f" Task description: {self.task_description} "
-    #         f" Input statistics: "
-    #         f"<|end_prompt|>"
-    #     )
-    #     instruction_tokens = self.tokenizer(instruction, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
-    #     instruction_tokens = instruction_tokens.to(self.device)
-    #     instruction_embeddings = self.plm.get_input_embeddings()(instruction_tokens)
-    #     return instruction_embeddings.shape
-    # def get_action_size(self):
-    #     action = torch.rand((1, 10, 1), dtype=torch.float32, device=self.device)
-    #     action_embeddings = self.action_embedding(action)
-    #     return action_embeddings.shape
-    # def test_forward(self):
-    #     batch_size = 1
-    #     seq_len = 10
-    #     states = torch.rand((batch_size, seq_len, 6, 6), dtype=torch.float32)
-    #     actions = torch.randint(0, BITRATE_LEVELS, (batch_size, seq_len, 1), dtype=torch.float32)
-    #     returns = torch.rand((batch_size, seq_len, 1), dtype=torch.float32)
-    #     timesteps = torch.randint(0, 100, (batch_size, seq_len), dtype=torch.long)
-    #     action_pred = self.forward(states, actions, returns, timesteps)
-    #     print("Action prediction shape:", action_pred.shape)  # Expected: (batch_size, seq_len, BITRATE_LEVELS)
     
 class StateEncoder(nn.Module):
     def __init__(self, state_use_self_attention, conv_size=4, embed_dim=256, num_heads=8, hidden_dim=256, fusion_method='weighted_sum'):
@@ -546,19 +510,12 @@ class StateEncoder(nn.Module):
 
         # Self-attention layer that fuses 6 features into a single hidden representation
         if self.use_self_attention:
-            if fusion_method == 'mamba':
-                self.state_attention = MambaStateFeatureEncoder(
-                    embed_dim=embed_dim,
-                    hidden_dim=self.hidden_dim,
-                    d_state=16 # SSM 内部状态维度
-                )
-            else:
-                self.state_attention = StateFeatureSelfAttention(
-                    embed_dim=embed_dim, 
-                    hidden_dim=self.hidden_dim,
-                    num_heads=num_heads,
-                    fusion_method=fusion_method
-                )
+            self.state_attention = StateFeatureSelfAttention(
+                embed_dim=embed_dim,
+                hidden_dim=self.hidden_dim,
+                num_heads=num_heads,
+                fusion_method=fusion_method
+            )
 
 
     def forward(self, state, action_embedding=None, return_embedding=None):
@@ -791,69 +748,6 @@ class StateFeatureSelfAttention(nn.Module):
         
         return state_emb, action_emb, return_emb
 
-class MambaStateFeatureEncoder(nn.Module):
-    def __init__(self, embed_dim, hidden_dim=None, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.hidden_dim = hidden_dim if hidden_dim is not None else embed_dim
-        
-        # 使用 Mamba 替代 Self-Attention
-        # d_model: 输入维度
-        # d_state: SSM 状态维度，类似于 RNN 的 hidden state 维度
-        # d_conv: 局部卷积核大小，用于捕捉相邻特征的局部相关性
-        self.mamba = Mamba(
-            d_model=embed_dim, 
-            d_state=d_state, 
-            d_conv=d_conv, 
-            expand=expand
-        )
-        
-        # 融合后的投影层，保持与原结构输出一致
-        self.state_fusion_proj = nn.Linear(embed_dim, self.hidden_dim)
-        self.action_proj = nn.Linear(embed_dim, self.hidden_dim)
-        self.return_proj = nn.Linear(embed_dim, self.hidden_dim)
-        
-        self.fusion_norm = nn.LayerNorm(self.hidden_dim)
-        self.fusion_activation = nn.LeakyReLU()
-
-    def forward(self, state_features, action_embedding=None, return_embedding=None):
-        # state_features: List of 6 tensors (batch_size, seq_len, embed_dim)
-        batch_size, seq_len = state_features[0].shape[:2]
-        
-        # 1. 组装序列：[F1, F2, F3, F4, F5, F6, Action, Return]
-        # 将特征堆叠为 (batch_size * seq_len, num_features, embed_dim)
-        all_feats = [f.reshape(-1, 1, self.embed_dim) for f in state_features]
-        if action_embedding is not None:
-            all_feats.append(action_embedding.reshape(-1, 1, self.embed_dim))
-        if return_embedding is not None:
-            all_feats.append(return_embedding.reshape(-1, 1, self.embed_dim))
-            
-        stacked_sequence = torch.cat(all_feats, dim=1) # (B*L, N, D)
-        
-        # 2. Mamba 线性扫描处理
-        # 相比 Attention，Mamba 随特征数量 N 呈线性增加复杂度
-        mamba_output = self.mamba(stacked_sequence) # (B*L, N, D)
-        
-        # 3. 提取与融合 (模拟原代码逻辑)
-        # 提取前 6 个属于 state 的特征进行平均池化（或加权）
-        state_enhanced = mamba_output[:, :6, :].mean(dim=1) 
-        state_emb = self.fusion_norm(self.fusion_activation(self.state_fusion_proj(state_enhanced)))
-        state_emb = state_emb.view(batch_size, seq_len, -1)
-        
-        # 提取 Action 和 Return 对应的位置
-        action_emb = None
-        if action_embedding is not None:
-            action_enhanced = mamba_output[:, 6, :]
-            action_emb = self.action_proj(action_enhanced).view(batch_size, seq_len, -1)
-            
-        return_emb = None
-        if return_embedding is not None:
-            return_idx = 7 if action_embedding is not None else 6
-            return_enhanced = mamba_output[:, return_idx, :]
-            return_emb = self.return_proj(return_enhanced).view(batch_size, seq_len, -1)
-
-        return state_emb, action_emb, return_emb
-
 class AlignmentLayer(nn.Module):
     def __init__(self, state_dim, num_heads, key_dim, llm_dim, attention_dropout=0.1):
         super(AlignmentLayer, self).__init__()
@@ -905,104 +799,5 @@ class AlignmentLayer(nn.Module):
         if return_attn:
             return cross_attn_embeddings, attn
         return cross_attn_embeddings  # (batch_size, seq_len, num_heads, head_dim)
-
-def print_pickle_files():
-    with open('artifacts/exp_pools/exp_pool.pkl', 'rb') as f:
-        exp_pool = pickle.load(f)
-    print(dir(exp_pool))
-    print("经验池大小:", len(exp_pool.states))
-    # print("动作:", len(exp_pool.actions))
-    # 打印前 5 条经验（假设每个字段是列表）
-    for i in range(50):
-        print(f"经验 {i+1}:")
-        print("状态:", exp_pool.states[i])
-        print("动作:", exp_pool.actions[i])
-        print("奖励:", exp_pool.rewards[i])
-        print("是否结束:", exp_pool.dones[i])
-        print("-" * 40)
     
-def prepare_args():
-    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)    
-    args = parser.parse_args()
-
-    args.adapt = True
-    args.test = True
-    args.grad_accum_steps = 32
-    args.seed = 666
-    args.scale = 1000
-    args.model_dir = None
-    args.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    args.device_out = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    args.device_mid = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-
-    args.plm_type = 'llama'
-    args.plm_size = 'large'
-    args.rank =128
-    args.state_feature_dim = 256
-    args.state_embedding_dim = 256
-    args.llm_dim = 3072
-
-    args.frozen = True
-    args.num_heads = 8
-    args.key_dim = 128
-    args.state_use_self_attention = True
-    args.state_attn_hidden_dim = 256
-    args.fusion_method = 'weighted_sum'
-
-    args.w = 20
-    args.max_length = args.w
-    args.gamma = 1.
-    args.lr = 1e-4
-    args.weight_decay = 1e-4
-    args.warmup_steps = 2000
-    args.num_epochs = 50
-    args.eval_per_epoch = 2
-    args.save_checkpoint_per_epoch = 10
-    args.target_return_scale = 1.
-    args.which_layer = -1
-
-    args.exp_pool_path = 'artifacts/exp_pools/exp_pool.pkl'
-    args._base_dir = '' if 'adaptive_bitrate_streaming' in os.getcwd() else 'adaptive_bitrate_streaming/'
-    args.plm_dir = args._base_dir + ('../../downloaded_plms' if 'adaptive_bitrate_streaming' in args._base_dir else '../downloaded_plms')
-    args.model_path = os.path.join(args.plm_dir, args.plm_type, args.plm_size)
-    args.sample_step = None
-    args.trace = 'fcc-test'
-    args.trace_num = 100
-    args.video = 'video1'
-    args.fixed_order = True
-
-    return args
-
-def test_save_model():
-    args = prepare_args()
-    abrllm_model = ABRLLM(args)
-    abrllm_model.device = torch.device(args.device)
-    abrllm_model = abrllm_model.to(args.device)
-    abrllm_model.plm = peft_model(abrllm_model.plm, args.plm_type, rank=args.rank)
-    print(abrllm_model)
-
-    # plm_ft_dir = args._base_dir + 'data/ft_plms'
-    # train_exp_pool_info = args.exp_pool_path.split('/')[-4:-1]
-    # train_exp_pool_info = '_'.join(train_exp_pool_info)
-    # models_dir = os.path.join(
-    #     plm_ft_dir, 
-    #     f'{args.plm_type}_{args.plm_size}', 
-    #     train_exp_pool_info + f'_ss_{args.sample_step}', 
-    #     f'abrllm_rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'
-    #     f'_sattn_{args.state_use_self_attention}_sahd_{args.state_attn_hidden_dim}_fusion_{args.fusion_method}'
-    #     f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}'
-    # )
-    # checkpoint_dir = os.path.join(models_dir, 'checkpoint')
-    # best_model_dir = os.path.join(models_dir, 'best_model')
-    # save_dir = os.path.join(checkpoint_dir, str(0))
-    # if not os.path.exists(save_dir):
-    #     os.makedirs(save_dir)
-    # if args.rank > 0:
-    #     # save lora weights
-    #     abrllm_model.plm.save_pretrained(save_dir)
-    #     # save other modules except plm
-    #     torch.save(abrllm_model.modules_except_plm.state_dict(), os.path.join(save_dir, 'modules_except_plm.bin'))
-
-if __name__ == "__main__":
-    test_save_model()
     
