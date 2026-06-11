@@ -258,6 +258,7 @@ class ABRLLM(nn.Module):
 
         # Stack returns, states, actions for each timestep
         batch_size, seq_len = states.shape[0], states.shape[1]
+        #TODO: try state_emb, action_emb, return_emb instead of return_embeddings, state_embeddings, action_embeddings
         for i in range(seq_len):
             # All embeddings are already in float32
             concated_embeddings.append(return_embeddings[:, i:i+1, :])  # (batch, 1, llm_dim)

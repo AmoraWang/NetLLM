@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model, TaskType, get_peft_model_state_dict
 
+#TODO: try q,k,v,o instead of q_proj, v_proj
 
 TARGET_MODULES = {
     'llama': ["q_proj", "v_proj"],
